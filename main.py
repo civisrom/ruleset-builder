@@ -183,6 +183,11 @@ class SingBoxAdvancedGUI:
         main_notebook.add(downloader_tab, text="⬇️ Source Downloader")
         self.setup_downloader_tab(downloader_tab)
 
+        # === TAB 4: Quick Wizard (Hand-made) ===
+        wizard_tab = ttk.Frame(main_notebook, padding=10)
+        main_notebook.add(wizard_tab, text="🧙 Quick Wizard")
+        self.setup_wizard_tab(wizard_tab)
+
         # === Лог (общий) ===
         log_frame = ttk.LabelFrame(main_frame, text="Лог операций", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -554,6 +559,252 @@ Source File (JSON) содержит массив объектов с полям�
             self.master.after(0, lambda: messagebox.showinfo("Готово", f"Загружено {len(urls)} файлов в:\n{download_dir}"))
         
         thread = threading.Thread(target=download_all, daemon=True)
+        thread.start()
+
+    def setup_wizard_tab(self, parent):
+        """Пошаговый мастер создания Rule-Set (по инструкции)"""
+        
+        # === Инструкция ===
+        instr_frame = ttk.LabelFrame(parent, text="📖 Быстрое создание Rule-Set (Hand-made)", padding=10)
+        instr_frame.pack(fill=tk.X, pady=5)
+        
+        instr_text = tk.Text(instr_frame, height=6, wrap=tk.WORD, bg="#f0f0f0", font=("Consolas", 9))
+        instr_text.pack(fill=tk.X)
+        instr_text.insert(tk.END, """Этот мастер поможет быстро создать Rule-Set из списка доменов или IP:
+1. Укажите путь к generate-geoip-geosite.exe
+2. Выберите тип (домены или IP) и введите категорию
+3. Добавьте домены/IP построчно
+4. Нажмите "Создать Rule-Set" - программа автоматически создаст input/output папки и сгенерирует .srs файл
+""")
+        instr_text.config(state='disabled')
+
+        # === Step 1: Generator Path ===
+        step1_frame = ttk.LabelFrame(parent, text="Шаг 1: Путь к генератору", padding=5)
+        step1_frame.pack(fill=tk.X, pady=5)
+        
+        self.wizard_gen_path = tk.StringVar()
+        ttk.Entry(step1_frame, textvariable=self.wizard_gen_path, width=70).grid(row=0, column=0, padx=5)
+        ttk.Button(step1_frame, text="Выбрать exe", command=self.wizard_browse_gen).grid(row=0, column=1, padx=5)
+        ttk.Button(step1_frame, text="Скачать", command=self.open_download_page).grid(row=0, column=2)
+
+        # === Step 2: Type and Category ===
+        step2_frame = ttk.LabelFrame(parent, text="Шаг 2: Тип и категория", padding=5)
+        step2_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(step2_frame, text="Тип данных:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.wizard_type = tk.StringVar(value="domain")
+        ttk.Radiobutton(step2_frame, text="Домены (domain)", variable=self.wizard_type, value="domain").grid(row=0, column=1, sticky=tk.W)
+        ttk.Radiobutton(step2_frame, text="IP адреса (ip)", variable=self.wizard_type, value="ip").grid(row=0, column=2, sticky=tk.W)
+        
+        ttk.Label(step2_frame, text="Имя категории:").grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.wizard_category = tk.StringVar(value="custom")
+        ttk.Entry(step2_frame, textvariable=self.wizard_category, width=30).grid(row=1, column=1, columnspan=2, sticky=tk.W)
+        ttk.Label(step2_frame, text="(например: ads, vpn, block_ru)", font=("Arial", 8), foreground="gray").grid(row=2, column=1, columnspan=2, sticky=tk.W)
+
+        # === Step 3: Data Input ===
+        step3_frame = ttk.LabelFrame(parent, text="Шаг 3: Введите данные", padding=5)
+        step3_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        input_buttons_frame = ttk.Frame(step3_frame)
+        input_buttons_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(input_buttons_frame, text="📄 Загрузить из файла", command=self.wizard_load_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(input_buttons_frame, text="🗑️ Очистить", command=self.wizard_clear_data).pack(side=tk.LEFT)
+        ttk.Label(input_buttons_frame, text="Вводите по одной записи на строку:", foreground="blue").pack(side=tk.LEFT, padx=20)
+        
+        self.wizard_data = scrolledtext.ScrolledText(step3_frame, height=12, wrap=tk.WORD)
+        self.wizard_data.pack(fill=tk.BOTH, expand=True)
+        self.wizard_data.insert(tk.END, """# Примеры для доменов:
+example.com
+test.org
+*.google.com
+
+# Примеры для IP:
+10.0.0.0/8
+192.168.1.0/24
+8.8.8.8
+""")
+
+        # === Step 4: Options ===
+        step4_frame = ttk.LabelFrame(parent, text="Шаг 4: Опции", padding=5)
+        step4_frame.pack(fill=tk.X, pady=5)
+        
+        self.wizard_include = tk.BooleanVar(value=True)
+        ttk.Checkbutton(step4_frame, text="Include (добавить в список)", variable=self.wizard_include).grid(row=0, column=0, sticky=tk.W, padx=10)
+        ttk.Label(step4_frame, text="Если выключено - будет Exclude (исключить)", font=("Arial", 8), foreground="gray").grid(row=0, column=1, sticky=tk.W)
+        
+        self.wizard_use_regex = tk.BooleanVar(value=False)
+        ttk.Checkbutton(step4_frame, text="Использовать регулярные выражения (.rgx)", variable=self.wizard_use_regex).grid(row=1, column=0, sticky=tk.W, padx=10)
+        
+        self.wizard_open_folder = tk.BooleanVar(value=True)
+        ttk.Checkbutton(step4_frame, text="Открыть папку после генерации", variable=self.wizard_open_folder).grid(row=2, column=0, sticky=tk.W, padx=10)
+
+        # === Working Directory ===
+        workdir_frame = ttk.Frame(parent)
+        workdir_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(workdir_frame, text="Рабочая папка:").pack(side=tk.LEFT, padx=5)
+        self.wizard_workdir = tk.StringVar(value=os.path.join(os.getcwd(), "ruleset_wizard"))
+        ttk.Entry(workdir_frame, textvariable=self.wizard_workdir, width=60, state='readonly').pack(side=tk.LEFT, padx=5)
+        ttk.Button(workdir_frame, text="Изменить", command=self.wizard_change_workdir).pack(side=tk.LEFT)
+
+        # === Action Buttons ===
+        action_frame = ttk.Frame(parent)
+        action_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(action_frame, text="🚀 Создать Rule-Set", command=self.wizard_create_ruleset, style="Accent.TButton").pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="📂 Открыть output", command=self.wizard_open_output).pack(side=tk.LEFT, padx=5)
+        
+        # Progress
+        self.wizard_progress = ttk.Progressbar(parent, mode='indeterminate')
+        self.wizard_progress.pack(fill=tk.X, pady=5)
+
+    def wizard_browse_gen(self):
+        path = filedialog.askopenfilename(
+            title="Выберите generate-geoip-geosite.exe",
+            filetypes=[("EXE", "*.exe"), ("All", "*.*")]
+        )
+        if path:
+            self.wizard_gen_path.set(path)
+            self.log_msg(f"✓ Wizard: генератор выбран")
+
+    def open_download_page(self):
+        import webbrowser
+        webbrowser.open("https://github.com/Dunamis4tw/generate-geoip-geosite/releases")
+        self.log_msg("🌐 Открыта страница загрузки генератора")
+
+    def wizard_load_file(self):
+        path = filedialog.askopenfilename(title="Выберите файл со списком")
+        if not path:
+            return
+        items = read_list_from_file(path)
+        self.wizard_data.delete('1.0', tk.END)
+        self.wizard_data.insert(tk.END, '\n'.join(items))
+        self.log_msg(f"✓ Wizard: загружено {len(items)} записей")
+
+    def wizard_clear_data(self):
+        self.wizard_data.delete('1.0', tk.END)
+
+    def wizard_change_workdir(self):
+        path = filedialog.askdirectory(title="Выберите рабочую папку")
+        if path:
+            self.wizard_workdir.set(path)
+
+    def wizard_open_output(self):
+        output_dir = os.path.join(self.wizard_workdir.get(), "output")
+        if os.path.exists(output_dir):
+            import subprocess
+            import platform
+            if platform.system() == "Windows":
+                os.startfile(output_dir)
+            elif platform.system() == "Darwin":
+                subprocess.run(["open", output_dir])
+            else:
+                subprocess.run(["xdg-open", output_dir])
+            self.log_msg(f"📂 Открыта папка: {output_dir}")
+        else:
+            messagebox.showwarning("Папка не найдена", f"Output папка ещё не создана:\n{output_dir}")
+
+    def wizard_create_ruleset(self):
+        # Validation
+        if not self.wizard_gen_path.get() or not os.path.exists(self.wizard_gen_path.get()):
+            messagebox.showerror("Ошибка", "Выберите generate-geoip-geosite.exe!")
+            return
+
+        category = self.wizard_category.get().strip()
+        if not category:
+            messagebox.showerror("Ошибка", "Укажите имя категории!")
+            return
+
+        data_lines = parse_multiline_text(self.wizard_data)
+        if not data_lines:
+            messagebox.showerror("Ошибка", "Введите данные (домены или IP)!")
+            return
+
+        # Setup directories
+        workdir = self.wizard_workdir.get()
+        input_dir = os.path.join(workdir, "input")
+        output_dir = os.path.join(workdir, "output")
+        
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось создать директории:\n{str(e)}")
+            return
+
+        # Create filename: {include/exclude}-{ip/domain}-{category}.{lst/rgx}
+        prefix = "include" if self.wizard_include.get() else "exclude"
+        data_type = self.wizard_type.get()  # domain or ip
+        extension = "rgx" if self.wizard_use_regex.get() else "lst"
+        
+        filename = f"{prefix}-{data_type}-{category}.{extension}"
+        filepath = os.path.join(input_dir, filename)
+
+        # Write data to file
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                for line in data_lines:
+                    f.write(line + '\n')
+            self.log_msg(f"✓ Создан файл: {filename} ({len(data_lines)} записей)")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось записать файл:\n{str(e)}")
+            return
+
+        # Run generator
+        self.wizard_progress.start(10)
+        self.log_msg("⏳ Запуск генератора Rule-Set...")
+
+        def run_generation():
+            cmd = [
+                self.wizard_gen_path.get(),
+                "-i", input_dir,
+                "-o", output_dir,
+                "--gen-rule-set-srs"
+            ]
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(self.wizard_gen_path.get())
+                )
+                
+                self.master.after(0, lambda: self.wizard_progress.stop())
+                
+                if result.returncode == 0:
+                    output_file = os.path.join(output_dir, f"{category}.srs")
+                    json_file = os.path.join(output_dir, f"{category}.json")
+                    
+                    success_msg = f"✅ Rule-Set создан успешно!\n\n"
+                    success_msg += f"📁 Рабочая папка: {workdir}\n"
+                    success_msg += f"📄 Input файл: {filename}\n"
+                    
+                    if os.path.exists(output_file):
+                        size = os.path.getsize(output_file)
+                        success_msg += f"✓ SRS файл: {category}.srs ({size} байт)\n"
+                    if os.path.exists(json_file):
+                        size = os.path.getsize(json_file)
+                        success_msg += f"✓ JSON файл: {category}.json ({size} байт)\n"
+                    
+                    success_msg += f"\n📊 Записей обработано: {len(data_lines)}"
+                    
+                    self.master.after(0, lambda: self.log_msg(success_msg))
+                    self.master.after(0, lambda: messagebox.showinfo("Успех", success_msg))
+                    
+                    # Open folder if requested
+                    if self.wizard_open_folder.get():
+                        self.master.after(0, lambda: self.wizard_open_output())
+                else:
+                    error_msg = f"Ошибка генерации:\n{result.stderr}"
+                    self.master.after(0, lambda: self.log_msg(f"✗ {error_msg}"))
+                    self.master.after(0, lambda: messagebox.showerror("Ошибка", error_msg))
+                    
+            except Exception as e:
+                self.master.after(0, lambda: self.wizard_progress.stop())
+                error_msg = f"Ошибка запуска генератора:\n{str(e)}"
+                self.master.after(0, lambda: self.log_msg(f"✗ {error_msg}"))
+                self.master.after(0, lambda: messagebox.showerror("Ошибка", error_msg))
+
+        thread = threading.Thread(target=run_generation, daemon=True)
         thread.start()
 
     # === Logging ===
