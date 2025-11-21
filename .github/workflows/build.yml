@@ -117,19 +117,19 @@ jobs:
     
     - name: Run tests
       run: |
-        # Создаём простой тест
-        python -c "
-import sys
-sys.path.insert(0, '.')
-from ruleset_builder import FileProcessor, RulesetGenerator
-
-# Тест валидации домена
-assert FileProcessor.validate_domain('example.com') == True
-assert FileProcessor.validate_domain('invalid..com') == False
-
-# Тест валидации IP
-assert FileProcessor.validate_ip_cidr('192.168.1.0/24') == True
-assert FileProcessor.validate_ip_cidr('999.999.999.999') == False
-
-print('✅ All tests passed!')
-"
+        # Создаём тестовый скрипт
+        cat > test_basic.py << 'EOF'
+        import sys
+        sys.path.insert(0, '.')
+        from ruleset_builder import FileProcessor, RulesetGenerator
+        
+        # Тест валидации домена
+        assert FileProcessor.validate_domain('example.com') == True
+        assert FileProcessor.validate_domain('invalid..com') == False
+        
+        # Тест валидации IP
+        assert FileProcessor.validate_ip_cidr('192.168.1.0/24') == True
+        assert FileProcessor.validate_ip_cidr('999.999.999.999') == False
+        
+        print('✅ All tests passed!')
+        EOF
