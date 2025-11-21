@@ -1,4 +1,4 @@
-name: Build RulesetBuilder
+name: Build Ruleset Builder
 
 on:
   push:
@@ -16,29 +16,28 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+        
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
-    - name: Build executable with PyInstaller
+        
+    - name: Build with PyInstaller
       run: |
-        pyinstaller RulesetBuilder.spec
-    
+        pyinstaller --onefile --windowed --name="RulesetBuilder" --icon=NONE main.py
+        
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: RulesetBuilder-Windows
         path: dist/RulesetBuilder.exe
-        retention-days: 30
-    
-    - name: Create Release (on tag)
+        
+    - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
@@ -54,34 +53,28 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-tk
-    
+        
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
-    - name: Build executable with PyInstaller
+        
+    - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name RulesetBuilder main.py
-    
+        pyinstaller --onefile --name="RulesetBuilder" main.py
+        
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: RulesetBuilder-Linux
         path: dist/RulesetBuilder
-        retention-days: 30
-    
-    - name: Create Release (on tag)
+        
+    - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
@@ -97,29 +90,28 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
-    
+        python-python: '3.11'
+        
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
-    - name: Build executable with PyInstaller
+        
+    - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name RulesetBuilder main.py
-    
+        pyinstaller --onefile --windowed --name="RulesetBuilder" main.py
+        
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: RulesetBuilder-macOS
         path: dist/RulesetBuilder
-        retention-days: 30
-    
-    - name: Create Release (on tag)
+        
+    - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
