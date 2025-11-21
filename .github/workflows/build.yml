@@ -1,135 +1,83 @@
-name: Build and Release Rulesets
+name: Build & Release
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    tags:
+      - 'v*'
   workflow_dispatch:
-  schedule:
-    # Запуск каждый день в 00:00 UTC для обновления правил
-    - cron: '0 0 * * *'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12']
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v4
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
-        cache: 'pip'
-    
+        python-version: ${{ matrix.python-version }}
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    
-    - name: Create output directory
-      run: mkdir -p output
-    
-    - name: Validate ruleset builder
+        pip install -r requirements.txt
+
+    - name: Run tests
       run: |
-        python ruleset_builder.py --help || echo "CLI validation skipped"
-    
-    - name: Generate JSON ruleset
+        python -m pytest tests/ -v
+
+    - name: Build executable (Windows)
+      if: runner.os == 'Windows'
       run: |
-        # Пример генерации ruleset из файлов в data/
-        if [ -d "data" ]; then
-          python ruleset_builder.py \
-            -o output/ruleset \
-            -f json \
-            --domain data/domains.txt \
-            --domain-suffix data/suffixes.txt \
-            --ip-cidr data/ips.txt \
-            --validate
-        else
-          echo "No data directory found, skipping generation"
-        fi
-    
-    - name: Upload JSON artifacts
-      uses: actions/upload-artifact@v4
+        pip install pyinstaller
+        pyinstaller --onefile --windowed --name RulesetGenerator main.py
+
+    - name: Build executable (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        pip install pyinstaller
+        pyinstaller --onefile --name RulesetGenerator main.py
+
+    - name: Build executable (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        pip install pyinstaller
+        pyinstaller --onefile --windowed --name RulesetGenerator main.py
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
       with:
-        name: rulesets-json
-        path: output/*.json
-        retention-days: 90
-    
-    - name: Create Release (on tag)
+        name: RulesetGenerator-${{ runner.os }}-${{ matrix.python-version }}
+        path: dist/
+
+    - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
-        files: |
-          output/*.json
-          output/*.srs
-          output/*.mrs
+        files: dist/**/*
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  
-  build-windows:
-    runs-on: windows-latest
-    needs: build
-    
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-    
-    - name: Build Windows executable
-      run: |
-        pyinstaller --onefile --windowed --name RulesetBuilder ruleset_builder.py
-    
-    - name: Upload Windows executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: RulesetBuilder-Windows
-        path: dist/RulesetBuilder.exe
-        retention-days: 90
-  
-  test:
+
+  lint:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v4
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
-    
-    - name: Install test dependencies
+        python-version: '3.12'
+    - name: Install linters
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pytest-cov
-    
-    - name: Run tests
-      run: |
-        # Создаём тестовый скрипт
-        cat > test_basic.py << 'EOF'
-        import sys
-        sys.path.insert(0, '.')
-        from ruleset_builder import FileProcessor, RulesetGenerator
-        
-        # Тест валидации домена
-        assert FileProcessor.validate_domain('example.com') == True
-        assert FileProcessor.validate_domain('invalid..com') == False
-        
-        # Тест валидации IP
-        assert FileProcessor.validate_ip_cidr('192.168.1.0/24') == True
-        assert FileProcessor.validate_ip_cidr('999.999.999.999') == False
-        
-        print('✅ All tests passed!')
-        EOF
+        pip install pylint flake8 black
+    - name: Lint with flake8
+      run: flake8 main.py --count --select=E9,F63,F7,F82 --show-source --statistics
+    - name: Check with black
+      run: black --check main.py || true
