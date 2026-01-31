@@ -1021,7 +1021,7 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             btn_frame,
-            text="🔄 Обновить превью",
+            text="Обновить превью",
             command=self.update_preview
         ).pack(side=tk.LEFT)
         
@@ -1043,7 +1043,7 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             left_frame,
-            text="📊 Статистика",
+            text="Статистика",
             command=self.show_statistics
         ).pack(side=tk.LEFT, padx=5)
         
@@ -1310,7 +1310,7 @@ class RulesetBuilderGUI:
         )
         if path:
             self.geoip_geosite_path.set(path)
-            self.log_msg(f"📁 Выбран generate-geoip-geosite: {path}")
+            self.log_msg(f"Выбран generate-geoip-geosite: {path}")
     
     def browse_singbox(self):
         """Выбор sing-box.exe"""
@@ -1321,7 +1321,7 @@ class RulesetBuilderGUI:
         if path:
             self.singbox_path.set(path)
             self.output_dir.set(os.path.dirname(path))
-            self.log_msg(f"📁 Выбран sing-box: {path}")
+            self.log_msg(f"Выбран sing-box: {path}")
     
     def browse_mihomo(self):
         """Выбор mihomo.exe"""
@@ -1331,14 +1331,14 @@ class RulesetBuilderGUI:
         )
         if path:
             self.mihomo_path.set(path)
-            self.log_msg(f"📁 Выбран mihomo: {path}")
+            self.log_msg(f"Выбран mihomo: {path}")
     
     def browse_output_dir(self):
         """Выбор папки для выходных файлов"""
         path = filedialog.askdirectory(title="Выберите папку для сохранения")
         if path:
             self.output_dir.set(path)
-            self.log_msg(f"📁 Папка вывода: {path}")
+            self.log_msg(f"Папка вывода: {path}")
     
     def load_file(self, key: str, category: str):
         """Загрузка данных из файла"""
@@ -1349,7 +1349,7 @@ class RulesetBuilderGUI:
         if not path:
             return
         
-        self.log_msg(f"📂 Загрузка файла: {os.path.basename(path)}...")
+        self.log_msg(f"Загрузка файла: {os.path.basename(path)}...")
         
         def load_task():
             try:
@@ -1515,7 +1515,7 @@ class RulesetBuilderGUI:
             return
         
         self.log_msg(f"{msg}")
-        self.log_msg(f"📊 Статистика: Домены={stats['domains']}, IP={stats['ips']}, Процессы={stats['processes']}, Сеть={stats['network']}")
+        self.log_msg(f"Статистика: Домены={stats['domains']}, IP={stats['ips']}, Процессы={stats['processes']}, Сеть={stats['network']}")
         
         # Компиляция .srs
         if self.compile_srs.get():
@@ -1537,7 +1537,7 @@ class RulesetBuilderGUI:
             elif has_domains and has_ips:
                 behavior_type = "classical"
             
-            self.log_msg(f"📝 Использован behavior type: {behavior_type}")
+            self.log_msg(f"Использован behavior type: {behavior_type}")
             
             # Создаём промежуточный YAML файл
             yaml_path = os.path.join(output_dir, f"{filename}_mihomo.yaml")
@@ -1558,7 +1558,7 @@ class RulesetBuilderGUI:
                 
                 # НЕ удаляем промежуточный YAML - оставляем для проверки
                 if success_mrs:
-                    self.log_msg(f"📄 Промежуточный YAML сохранён: {os.path.basename(yaml_path)}")
+                    self.log_msg(f"Промежуточный YAML сохранён: {os.path.basename(yaml_path)}")
             else:
                 self.log_msg(f"{msg_yaml}")
         
@@ -1580,18 +1580,18 @@ class RulesetBuilderGUI:
             self.network_widgets['network_interface_address'].delete('1.0', tk.END)
             self.network_widgets['default_interface_address'].delete('1.0', tk.END)
             
-            self.log_msg("🗑️ Все поля очищены")
+            self.log_msg("Все поля очищены")
     
     def show_statistics(self):
         """Показать статистику"""
         data = self.collect_data()
         
-        stats_text = "📊 СТАТИСТИКА ДАННЫХ\n\n"
+        stats_text = "СТАТИСТИКА ДАННЫХ\n\n"
         stats_text += "=" * 40 + "\n\n"
         
         total = 0
         
-        stats_text += "🌐 Домены:\n"
+        stats_text += "Домены:\n"
         for key in ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex']:
             count = len(data.get(key, []))
             total += count
@@ -1621,7 +1621,7 @@ class RulesetBuilderGUI:
     
     def update_preview(self):
         """Обновление превью JSON"""
-        self.log_msg("🔄 Обновление превью...")
+        self.log_msg("Обновление превью...")
         
         data = self.collect_data()
         
@@ -1703,14 +1703,14 @@ class RulesetBuilderGUI:
         path = filedialog.askdirectory(title="Выберите Input Directory")
         if path:
             self.geo_input_dir.set(path)
-            self.log_msg(f"📁 Input Directory: {path}")
+            self.log_msg(f"Input Directory: {path}")
     
     def browse_geo_output_dir(self):
         """Выбор Output директории"""
         path = filedialog.askdirectory(title="Выберите Output Directory")
         if path:
             self.geo_output_dir.set(path)
-            self.log_msg(f"📁 Output Directory: {path}")
+            self.log_msg(f"Output Directory: {path}")
     
     def browse_source_file(self):
         """Выбор source.json файла"""
@@ -1720,7 +1720,7 @@ class RulesetBuilderGUI:
         )
         if path:
             self.geo_source_file.set(path)
-            self.log_msg(f"📁 Source файл: {os.path.basename(path)}")
+            self.log_msg(f"Source файл: {os.path.basename(path)}")
     
     def create_geo_input_files(self):
         """Создание входных файлов из текущих данных"""
@@ -1881,7 +1881,7 @@ class RulesetBuilderGUI:
             else:
                 subprocess.run(['xdg-open', output_dir])
             
-            self.log_msg(f"📂 Открыта папка: {output_dir}")
+            self.log_msg(f"Открыта папка: {output_dir}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{str(e)}")
     
@@ -1897,7 +1897,7 @@ class RulesetBuilderGUI:
                 with open(path, 'r', encoding='utf-8') as f:
                     template = json.load(f)
                 self.apply_template(template)
-                self.log_msg(f"📂 Шаблон загружен: {os.path.basename(path)}")
+                self.log_msg(f"Шаблон загружен: {os.path.basename(path)}")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось загрузить шаблон:\n{str(e)}")
     
@@ -1910,7 +1910,7 @@ class RulesetBuilderGUI:
         if not path:
             return
         
-        self.log_msg(f"📂 Загрузка файла для Mihomo: {os.path.basename(path)}...")
+        self.log_msg(f"Загрузка файла для Mihomo: {os.path.basename(path)}...")
         
         try:
             items = FileProcessor.read_large_file(path)
@@ -2024,8 +2024,8 @@ class RulesetBuilderGUI:
         
         self.log_msg("=" * 60)
         self.log_msg("Генерация .mrs файла для Mihomo...")
-        self.log_msg(f"📝 Behavior type: {behavior}")
-        self.log_msg(f"📊 Доменов: {len(domains)}, IP: {len(ips)}")
+        self.log_msg(f"Behavior type: {behavior}")
+        self.log_msg(f"Доменов: {len(domains)}, IP: {len(ips)}")
         
         # Создаём данные для генератора
         data = {}
@@ -2060,7 +2060,7 @@ class RulesetBuilderGUI:
             
             # Сохраняем YAML
             if success_mrs:
-                self.log_msg(f"📄 YAML файл сохранён: {os.path.basename(yaml_path)}")
+                self.log_msg(f"YAML файл сохранён: {os.path.basename(yaml_path)}")
                 messagebox.showinfo(
                     "Успех!",
                     f"Файлы созданы:\n\n"
@@ -2155,49 +2155,49 @@ def cli_mode():
         data['source_ip_cidr'] = FileProcessor.read_large_file(args.source_ip_cidr)
     
     if args.validate:
-        print("🔍 Валидация данных...")
+        print("Валидация данных...")
     
     output_path = f"{args.output}.{args.format}"
     
     if args.format == 'json':
         success, msg, stats = RulesetGenerator.generate_singbox_json(data, output_path)
-        print(f"{'✅' if success else '❌'} {msg}")
+        print(f"{'[OK]' if success else '[ERROR]'} {msg}")
         if success:
-            print(f"📊 Статистика: {stats}")
+            print(f"Статистика: {stats}")
     
     elif args.format == 'srs':
         json_path = f"{args.output}.json"
         success, msg, stats = RulesetGenerator.generate_singbox_json(data, json_path)
         if success:
-            print(f"✅ {msg}")
+            print(f"{msg}")
             if args.singbox:
                 success_srs, msg_srs = RulesetGenerator.compile_srs(args.singbox, json_path)
-                print(f"{'✅' if success_srs else '❌'} {msg_srs}")
+                print(f"{'[OK]' if success_srs else '[ERROR]'} {msg_srs}")
             else:
-                print("❌ Требуется --singbox для компиляции .srs")
+                print("[ERROR] Требуется --singbox для компиляции .srs")
     
     elif args.format == 'mrs':
         yaml_path = f"{args.output}_mihomo.yaml"
         success, msg, stats = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
         if success:
-            print(f"✅ {msg}")
+            print(f"{msg}")
             if args.mihomo:
                 # Определяем behavior type
                 has_domains = any(data.get(k) for k in ['domain', 'domain_suffix', 'domain_keyword'])
-                has_ips = data.get('ip_cidr') or data.get('source_ip_cidr')
-                
+                has_ips = any(data.get(k) for k in ['ip_cidr', 'source_ip_cidr'])
+
                 if has_ips and not has_domains:
                     behavior_type = "ipcidr"
                 elif has_domains and has_ips:
                     behavior_type = "classical"
                 else:
                     behavior_type = "domain"
-                
-                print(f"📝 Использован behavior type: {behavior_type}")
+
+                print(f"Использован behavior type: {behavior_type}")
                 success_mrs, msg_mrs = RulesetGenerator.compile_mrs(args.mihomo, yaml_path, output_path, behavior_type)
-                print(f"{'✅' if success_mrs else '❌'} {msg_mrs}")
+                print(f"{'[OK]' if success_mrs else '[ERROR]'} {msg_mrs}")
             else:
-                print("❌ Требуется --mihomo для компиляции .mrs")
+                print("[ERROR] Требуется --mihomo для компиляции .mrs")
 
 # ============================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
