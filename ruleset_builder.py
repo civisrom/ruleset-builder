@@ -410,7 +410,10 @@ class RulesetBuilderGUI:
         master.title(f"Ruleset Builder v{VERSION} - Sing-Box, Mihomo & GeoIP/GeoSite")
         master.geometry("1100x800")
         master.minsize(900, 650)
-        
+
+        # Установка иконки приложения
+        self._set_icon(master)
+
         # Переменные
         self.singbox_path = tk.StringVar()
         self.mihomo_path = tk.StringVar()  # ДОБАВЛЕНО: путь к mihomo.exe
@@ -1085,7 +1088,30 @@ class RulesetBuilderGUI:
                 messagebox.showinfo("Успех", f"Лог сохранён:\n{os.path.basename(path)}")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось сохранить лог:\n{str(e)}")
-    
+
+    def _set_icon(self, window):
+        """Установка иконки приложения"""
+        try:
+            # Попытка загрузить иконку из файла
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.png')
+
+            if os.path.exists(icon_path):
+                # Для Windows, Linux и macOS
+                try:
+                    icon = tk.PhotoImage(file=icon_path)
+                    window.iconphoto(True, icon)
+                    # Сохраняем ссылку чтобы избежать garbage collection
+                    window._icon = icon
+                except Exception as e:
+                    # Если не удалось загрузить PNG, пробуем ICO (только Windows)
+                    if sys.platform == 'win32':
+                        icon_ico = icon_path.replace('.png', '.ico')
+                        if os.path.exists(icon_ico):
+                            window.iconbitmap(icon_ico)
+        except Exception:
+            # Игнорируем ошибки загрузки иконки - не критично
+            pass
+
     def apply_theme(self):
         """Применение темы оформления"""
         style = ttk.Style()
