@@ -29,7 +29,7 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --windowed --name="RulesetBuilder" --icon=NONE main.py
+        pyinstaller --onefile --windowed --name="RulesetBuilder" --icon=icon.ico main.py
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -66,7 +66,7 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --name="RulesetBuilder" main.py
+        pyinstaller --onefile --name="RulesetBuilder" --icon=icon.png main.py
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
