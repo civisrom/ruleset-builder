@@ -24,7 +24,7 @@ import threading
 # КОНСТАНТЫ И КОНФИГУРАЦИЯ
 # ============================================================================
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 SUPPORTED_FORMATS = {
     'singbox': {'json': 'JSON Rule Set', 'srs': 'SRS Binary (compiled)'},
     'mihomo': {'mrs': 'MRS Binary (Mihomo Rule Set)'}
@@ -69,15 +69,16 @@ class FileProcessor:
         bytes_read = 0
         
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.strip()
+            for original_line in f:
+                # Отслеживаем прогресс по оригинальной строке (с переносами)
+                bytes_read += len(original_line.encode('utf-8'))
+                if progress_callback and file_size > 0:
+                    progress = min(int((bytes_read / file_size) * 100), 100)
+                    progress_callback(progress)
+
+                line = original_line.strip()
                 if line and not line.startswith('#'):
                     lines.append(line)
-                
-                bytes_read += len(line.encode('utf-8'))
-                if progress_callback and file_size > 0:
-                    progress = int((bytes_read / file_size) * 100)
-                    progress_callback(progress)
         
         return lines
     
@@ -378,7 +379,8 @@ class RulesetGenerator:
             if cleanup_yaml and os.path.exists(yaml_in_output):
                 try:
                     os.remove(yaml_in_output)
-                except:
+                except (OSError, PermissionError) as e:
+                    # Игнорируем ошибки удаления временного файла
                     pass
             
             if result.returncode == 0:
@@ -405,9 +407,9 @@ class RulesetBuilderGUI:
     
     def __init__(self, master):
         self.master = master
-        master.title(f"Ruleset Builder v{VERSION} — Sing-Box, Mihomo & GeoIP/GeoSite")
-        master.geometry("1200x900")
-        master.minsize(1000, 750)
+        master.title(f"Ruleset Builder v{VERSION} - Sing-Box, Mihomo & GeoIP/GeoSite")
+        master.geometry("1100x800")
+        master.minsize(900, 650)
         
         # Переменные
         self.singbox_path = tk.StringVar()
@@ -463,7 +465,7 @@ class RulesetBuilderGUI:
     
     def setup_top_panel(self, parent):
         """Верхняя панель с настройками"""
-        top_frame = ttk.LabelFrame(parent, text="⚙️ Настройки", padding=10)
+        top_frame = ttk.LabelFrame(parent, text="Настройки", padding=10)
         top_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Sing-box путь
@@ -472,7 +474,7 @@ class RulesetBuilderGUI:
         ttk.Entry(top_frame, textvariable=self.singbox_path, width=50).grid(
             row=row, column=1, columnspan=2, sticky=tk.EW, padx=5
         )
-        ttk.Button(top_frame, text="📁", command=self.browse_singbox, width=3).grid(
+        ttk.Button(top_frame, text="...", command=self.browse_singbox, width=3).grid(
             row=row, column=3, padx=2
         )
         
@@ -482,7 +484,7 @@ class RulesetBuilderGUI:
         ttk.Entry(top_frame, textvariable=self.mihomo_path, width=50).grid(
             row=row, column=1, columnspan=2, sticky=tk.EW, padx=5
         )
-        ttk.Button(top_frame, text="📁", command=self.browse_mihomo, width=3).grid(
+        ttk.Button(top_frame, text="...", command=self.browse_mihomo, width=3).grid(
             row=row, column=3, padx=2
         )
         
@@ -492,7 +494,7 @@ class RulesetBuilderGUI:
         ttk.Entry(top_frame, textvariable=self.geoip_geosite_path, width=50).grid(
             row=row, column=1, columnspan=2, sticky=tk.EW, padx=5
         )
-        ttk.Button(top_frame, text="📁", command=self.browse_geoip_geosite, width=3).grid(
+        ttk.Button(top_frame, text="...", command=self.browse_geoip_geosite, width=3).grid(
             row=row, column=3, padx=2
         )
         
@@ -520,7 +522,7 @@ class RulesetBuilderGUI:
         ttk.Entry(top_frame, textvariable=self.output_dir, width=50, state='readonly').grid(
             row=row, column=1, columnspan=2, sticky=tk.EW, padx=5
         )
-        ttk.Button(top_frame, text="📁", command=self.browse_output_dir, width=3).grid(
+        ttk.Button(top_frame, text="...", command=self.browse_output_dir, width=3).grid(
             row=row, column=3, padx=2
         )
         
@@ -531,19 +533,19 @@ class RulesetBuilderGUI:
         
         ttk.Checkbutton(
             options_frame,
-            text="✓ Компилировать .srs",
+            text="Компилировать .srs",
             variable=self.compile_srs
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Checkbutton(
             options_frame,
-            text="✓ Генерировать .mrs (Mihomo)",
+            text="Генерировать .mrs (Mihomo)",
             variable=self.generate_mrs
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Checkbutton(
             options_frame,
-            text="✓ Валидация входных данных",
+            text="Валидация входных данных",
             variable=self.validate_input
         ).pack(side=tk.LEFT, padx=5)
         
@@ -564,14 +566,14 @@ class RulesetBuilderGUI:
         # Кнопки действий справа
         ttk.Button(
             action_btn_frame,
-            text="🚀 Генерировать Ruleset",
+            text="Генерировать Ruleset",
             command=self.generate_ruleset,
             style='Accent.TButton'
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             action_btn_frame,
-            text="🗑️ Очистить всё",
+            text="Очистить всё",
             command=self.clear_all
         ).pack(side=tk.LEFT, padx=5)
         
@@ -580,39 +582,39 @@ class RulesetBuilderGUI:
         
         # Вкладка Domains
         self.domain_frame = self.create_domain_tab(notebook)
-        notebook.add(self.domain_frame, text="🌐 Domains")
+        notebook.add(self.domain_frame, text="Domains")
         
         # Вкладка IPs
         self.ip_frame = self.create_ip_tab(notebook)
-        notebook.add(self.ip_frame, text="🔢 IP Addresses")
+        notebook.add(self.ip_frame, text="IP Addresses")
         
         # Вкладка Process
         self.process_frame = self.create_process_tab(notebook)
-        notebook.add(self.process_frame, text="⚙️ Processes")
+        notebook.add(self.process_frame, text="Processes")
         
         # Вкладка Network
         self.network_frame = self.create_network_tab(notebook)
-        notebook.add(self.network_frame, text="📡 Network")
+        notebook.add(self.network_frame, text="Network")
         
         # НОВАЯ вкладка Mihomo
         self.mihomo_frame = self.create_mihomo_tab(notebook)
-        notebook.add(self.mihomo_frame, text="🔷 Mihomo Rules")
+        notebook.add(self.mihomo_frame, text="Mihomo Rules")
         
         # Вкладка Шаблоны
         self.templates_frame = self.create_templates_tab(notebook)
-        notebook.add(self.templates_frame, text="📋 Шаблоны")
+        notebook.add(self.templates_frame, text="Шаблоны")
         
         # Вкладка Превью
         self.preview_frame = self.create_preview_tab(notebook)
-        notebook.add(self.preview_frame, text="👁️ Превью")
+        notebook.add(self.preview_frame, text="Превью")
     
         # Вкладка GeoIP/GeoSite
         self.geoip_frame = self.create_geoip_geosite_tab(notebook)
-        notebook.add(self.geoip_frame, text="🌍 GeoIP/GeoSite")
+        notebook.add(self.geoip_frame, text="GeoIP/GeoSite")
         
         # Вкладка лога
         self.log_frame = self.create_log_tab(notebook)
-        notebook.add(self.log_frame, text="📋 Лог событий")
+        notebook.add(self.log_frame, text="Лог событий")
     
     def create_domain_tab(self, parent):
         """Вкладка доменов"""
@@ -801,7 +803,7 @@ class RulesetBuilderGUI:
         
         ttk.Label(
             info_left,
-            text="🔷 Mihomo Rule Set Generator",
+            text="Mihomo Rule Set Generator",
             font=('TkDefaultFont', 12, 'bold'),
             foreground='#0066cc'
         ).pack(anchor=tk.W)
@@ -819,63 +821,62 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             btn_right,
-            text="👁️ Просмотр YAML",
+            text="Просмотр YAML",
             command=self.preview_mihomo_yaml,
             style='Accent.TButton'
         ).pack(side=tk.LEFT, padx=2)
         
         ttk.Button(
             btn_right,
-            text="🚀 Создать MRS",
+            text="Создать MRS",
             command=self.generate_mihomo_only,
             style='Accent.TButton'
         ).pack(side=tk.LEFT, padx=2)
         
         ttk.Button(
             btn_right,
-            text="🗑️ Очистить",
-            command=lambda: [self.mihomo_domain_widget.delete('1.0', tk.END), 
-                            self.mihomo_ip_widget.delete('1.0', tk.END)]
+            text="Очистить",
+            command=self.clear_mihomo_widgets
         ).pack(side=tk.LEFT, padx=2)
         
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
         
         # Выбор типа правил
-        type_frame = ttk.LabelFrame(frame, text="⚙️ Тип правил (behavior)", padding=10)
+        type_frame = ttk.LabelFrame(frame, text="Тип правил (behavior)", padding=10)
         type_frame.pack(fill=tk.X, pady=(0, 10))
         
         self.mihomo_behavior = tk.StringVar(value="auto")
         
         ttk.Radiobutton(
             type_frame,
-            text="🤖 Автоматически (рекомендуется)",
+            text="Автоматически (рекомендуется)",
             variable=self.mihomo_behavior,
             value="auto"
         ).pack(anchor=tk.W, pady=2)
         
         ttk.Radiobutton(
             type_frame,
-            text="🌐 Domain - только домены",
+            text="Domain - только домены",
             variable=self.mihomo_behavior,
             value="domain"
         ).pack(anchor=tk.W, pady=2)
         
         ttk.Radiobutton(
             type_frame,
-            text="🔢 IPCIDR - только IP адреса",
+            text="IPCIDR - только IP адреса",
             variable=self.mihomo_behavior,
             value="ipcidr"
         ).pack(anchor=tk.W, pady=2)
         
         ttk.Radiobutton(
             type_frame,
-            text="📋 Classical - домены + IP",
+            text="Classical - домены + IP",
             variable=self.mihomo_behavior,
             value="classical"
         ).pack(anchor=tk.W, pady=2)
         
         # Поле для доменов
-        domain_frame = ttk.LabelFrame(frame, text="🌐 Домены (для domain и classical)", padding=5)
+        domain_frame = ttk.LabelFrame(frame, text="Домены (для domain и classical)", padding=5)
         domain_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Подсказка для доменов
@@ -897,13 +898,13 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             domain_btn_frame,
-            text="📁 Загрузить",
+            text="...Загрузить",
             command=lambda: self.load_mihomo_file('domain')
         ).pack(fill=tk.X, pady=2)
         
         ttk.Button(
             domain_btn_frame,
-            text="🗑️ Очистить",
+            text="Очистить",
             command=lambda: domain_text.delete('1.0', tk.END)
         ).pack(fill=tk.X, pady=2)
         
@@ -919,7 +920,7 @@ class RulesetBuilderGUI:
         domain_text.bind('<KeyRelease>', update_domain_count)
         
         # Поле для IP адресов
-        ip_frame = ttk.LabelFrame(frame, text="🔢 IP адреса (для ipcidr и classical)", padding=5)
+        ip_frame = ttk.LabelFrame(frame, text="IP адреса (для ipcidr и classical)", padding=5)
         ip_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Подсказка для IP
@@ -941,13 +942,13 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             ip_btn_frame,
-            text="📁 Загрузить",
+            text="...Загрузить",
             command=lambda: self.load_mihomo_file('ip')
         ).pack(fill=tk.X, pady=2)
         
         ttk.Button(
             ip_btn_frame,
-            text="🗑️ Очистить",
+            text="Очистить",
             command=lambda: ip_text.delete('1.0', tk.END)
         ).pack(fill=tk.X, pady=2)
         
@@ -984,7 +985,7 @@ class RulesetBuilderGUI:
             
             ttk.Button(
                 btn_frame,
-                text=f"📋 {template_name}",
+                text=f"{template_name}",
                 command=lambda t=template_data: self.apply_template(t),
                 width=30
             ).pack(side=tk.LEFT, padx=(0, 10))
@@ -999,13 +1000,13 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             custom_frame,
-            text="💾 Сохранить текущие данные как шаблон",
+            text="Сохранить текущие данные как шаблон",
             command=self.save_custom_template
         ).pack(fill=tk.X, pady=2)
         
         ttk.Button(
             custom_frame,
-            text="📂 Загрузить шаблон из файла",
+            text="Загрузить шаблон из файла",
             command=self.load_custom_template
         ).pack(fill=tk.X, pady=2)
         
@@ -1051,13 +1052,13 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             right_frame,
-            text="ℹ️ О программе",
+            text="О программе",
             command=self.show_about
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             right_frame,
-            text="❌ Выход",
+            text="Выход",
             command=self.master.quit
         ).pack(side=tk.LEFT, padx=5)
     
@@ -1110,7 +1111,7 @@ class RulesetBuilderGUI:
         )
         info_label.pack(anchor=tk.W, pady=(0, 10))
         
-        dirs_frame = ttk.LabelFrame(frame, text="📁 Директории:", padding=10)
+        dirs_frame = ttk.LabelFrame(frame, text="...Директории:", padding=10)
         dirs_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(dirs_frame, text="Input Directory:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -1139,30 +1140,30 @@ class RulesetBuilderGUI:
         
         dirs_frame.columnconfigure(1, weight=1)
         
-        gen_frame = ttk.LabelFrame(frame, text="⚙️ Параметры генерации:", padding=10)
+        gen_frame = ttk.LabelFrame(frame, text="Параметры генерации:", padding=10)
         gen_frame.pack(fill=tk.X, pady=10)
         
         ttk.Checkbutton(
             gen_frame,
-            text="✓ Генерировать GeoIP (.db)",
+            text="Генерировать GeoIP (.db)",
             variable=self.gen_geoip
         ).grid(row=0, column=0, sticky=tk.W, padx=10, pady=3)
         
         ttk.Checkbutton(
             gen_frame,
-            text="✓ Генерировать GeoSite (.db)",
+            text="Генерировать GeoSite (.db)",
             variable=self.gen_geosite
         ).grid(row=1, column=0, sticky=tk.W, padx=10, pady=3)
         
         ttk.Checkbutton(
             gen_frame,
-            text="✓ Генерировать Rule-Set JSON",
+            text="Генерировать Rule-Set JSON",
             variable=self.gen_rule_set_json
         ).grid(row=0, column=1, sticky=tk.W, padx=10, pady=3)
         
         ttk.Checkbutton(
             gen_frame,
-            text="✓ Генерировать Rule-Set SRS",
+            text="Генерировать Rule-Set SRS",
             variable=self.gen_rule_set_srs
         ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=3)
         
@@ -1171,25 +1172,25 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             action_frame,
-            text="📋 Создать входные файлы из текущих данных",
+            text="Создать входные файлы из текущих данных",
             command=self.create_geo_input_files,
             style='Accent.TButton'
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             action_frame,
-            text="🚀 Запустить генерацию",
+            text="Запустить генерацию",
             command=self.run_geoip_geosite_generation,
             style='Accent.TButton'
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             action_frame,
-            text="📂 Открыть папку вывода",
+            text="Открыть папку вывода",
             command=self.open_geo_output_dir
         ).pack(side=tk.LEFT, padx=5)
         
-        help_frame = ttk.LabelFrame(frame, text="ℹ️ Справка по использованию:", padding=10)
+        help_frame = ttk.LabelFrame(frame, text="Справка по использованию:", padding=10)
         help_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
         help_text = tk.Text(help_frame, height=12, wrap=tk.WORD, font=('TkDefaultFont', 9))
@@ -1262,19 +1263,19 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             header_frame,
-            text="🗑️ Очистить лог",
+            text="Очистить лог",
             command=self.clear_log
         ).pack(side=tk.RIGHT, padx=5)
         
         ttk.Button(
             header_frame,
-            text="💾 Сохранить лог",
+            text="Сохранить лог",
             command=self.save_log
         ).pack(side=tk.RIGHT, padx=5)
         
         ttk.Button(
             header_frame,
-            text="📋 Копировать",
+            text="Копировать",
             command=self.copy_log
         ).pack(side=tk.RIGHT, padx=5)
         
@@ -1283,7 +1284,7 @@ class RulesetBuilderGUI:
             height=30,
             state='disabled',
             wrap=tk.WORD,
-            font=('Consolas', 9)
+            font=('TkFixedFont', 9)
         )
         self.log.pack(fill=tk.BOTH, expand=True)
         
@@ -1297,7 +1298,7 @@ class RulesetBuilderGUI:
         
         self.log.bind("<Button-3>", show_log_menu)
         
-        self.log_msg("✅ Приложение запущено. Готово к работе.")
+        self.log_msg("Приложение запущено. Готово к работе.")
         
         return frame
     
@@ -1367,17 +1368,25 @@ class RulesetBuilderGUI:
                     text_widget.delete('1.0', tk.END)
                     text_widget.insert(tk.END, '\n'.join(items))
                     widget_dict['count'].config(text=f"Строк: {len(items)}")
-                    self.log_msg(f"✅ Загружено {len(items)} записей в {key}")
+                    self.log_msg(f"Загружено {len(items)} записей в {key}")
             except Exception as e:
-                self.log_msg(f"❌ Ошибка загрузки: {str(e)}")
+                self.log_msg(f"Ошибка загрузки: {str(e)}")
         
         threading.Thread(target=load_task, daemon=True).start()
     
     def clear_widget(self, widget):
         """Очистка текстового виджета"""
         widget.delete('1.0', tk.END)
-        self.log_msg("🗑️ Поле очищено")
-    
+        self.log_msg("Поле очищено")
+
+    def clear_mihomo_widgets(self):
+        """Безопасная очистка Mihomo виджетов"""
+        if self.mihomo_domain_widget is not None:
+            self.mihomo_domain_widget.delete('1.0', tk.END)
+        if self.mihomo_ip_widget is not None:
+            self.mihomo_ip_widget.delete('1.0', tk.END)
+        self.log_msg("Mihomo поля очищены")
+
     def on_text_change(self, key: str):
         """Обработка изменения текста"""
         for category in [self.domain_widgets, self.ip_widgets, self.process_widgets]:
@@ -1428,10 +1437,10 @@ class RulesetBuilderGUI:
             if len(errors) > 10:
                 error_msg += f"\n\n... и ещё {len(errors) - 10} ошибок"
             messagebox.showerror("Ошибки валидации", error_msg)
-            self.log_msg(f"❌ Валидация {key}: найдено {len(errors)} ошибок")
+            self.log_msg(f"Валидация {key}: найдено {len(errors)} ошибок")
         else:
             messagebox.showinfo("Валидация", f"✅ Все {len(lines)} записей валидны!")
-            self.log_msg(f"✅ Валидация {key}: OK")
+            self.log_msg(f"Валидация {key}: OK")
     
     def parse_multiline_text(self, text_widget) -> List[str]:
         """Парсинг текста из виджета"""
@@ -1471,7 +1480,7 @@ class RulesetBuilderGUI:
     
     def generate_ruleset(self):
         """Генерация ruleset"""
-        self.log_msg("🚀 Начало генерации ruleset...")
+        self.log_msg("Начало генерации ruleset...")
         
         # Проверка sing-box для .srs
         if self.compile_srs.get() and (not self.singbox_path.get() or not os.path.exists(self.singbox_path.get())):
@@ -1486,7 +1495,7 @@ class RulesetBuilderGUI:
         data = self.collect_data()
         
         if self.validate_input.get():
-            self.log_msg("🔍 Валидация данных...")
+            self.log_msg("Валидация данных...")
         
         filename = self.output_filename.get()
         if not filename:
@@ -1502,21 +1511,21 @@ class RulesetBuilderGUI:
         
         if not success:
             messagebox.showerror("Ошибка", msg)
-            self.log_msg(f"❌ {msg}")
+            self.log_msg(f"{msg}")
             return
         
-        self.log_msg(f"✅ {msg}")
+        self.log_msg(f"{msg}")
         self.log_msg(f"📊 Статистика: Домены={stats['domains']}, IP={stats['ips']}, Процессы={stats['processes']}, Сеть={stats['network']}")
         
         # Компиляция .srs
         if self.compile_srs.get():
-            self.log_msg("⚙️ Компиляция .srs...")
+            self.log_msg("Компиляция .srs...")
             success_srs, msg_srs = RulesetGenerator.compile_srs(self.singbox_path.get(), json_path)
             self.log_msg(f"{'✅' if success_srs else '❌'} {msg_srs}")
         
         # ИСПРАВЛЕНО: Генерация .mrs через mihomo.exe
         if self.generate_mrs.get():
-            self.log_msg("⚙️ Генерация .mrs для Mihomo...")
+            self.log_msg("Генерация .mrs для Mihomo...")
             
             # Определяем behavior type на основе данных
             behavior_type = "domain"  # По умолчанию domain
@@ -1535,7 +1544,7 @@ class RulesetBuilderGUI:
             success_yaml, msg_yaml, stats_yaml = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
             
             if success_yaml:
-                self.log_msg(f"✅ {msg_yaml}")
+                self.log_msg(f"{msg_yaml}")
                 
                 # Компилируем через mihomo.exe
                 mrs_path = os.path.join(output_dir, f"{filename}.mrs")
@@ -1551,7 +1560,7 @@ class RulesetBuilderGUI:
                 if success_mrs:
                     self.log_msg(f"📄 Промежуточный YAML сохранён: {os.path.basename(yaml_path)}")
             else:
-                self.log_msg(f"❌ {msg_yaml}")
+                self.log_msg(f"{msg_yaml}")
         
         messagebox.showinfo("Успех", "Ruleset успешно сгенерирован!")
         self.log_msg("=" * 60)
@@ -1646,7 +1655,7 @@ class RulesetBuilderGUI:
         self.preview_text.insert(tk.END, json.dumps(preview_json, indent=2, ensure_ascii=False))
         self.preview_text.configure(state='disabled')
         
-        self.log_msg("✅ Превью обновлено")
+        self.log_msg("Превью обновлено")
     
     def apply_template(self, template_data: Dict):
         """Применение шаблона"""
@@ -1670,9 +1679,9 @@ class RulesetBuilderGUI:
     def save_custom_template(self):
         """Сохранение пользовательского шаблона"""
         data = self.collect_data()
-        
-        template = {k: v for k, v in data.items() if v and (isinstance(v, list) and len(v) > 0 or isinstance(v, str) and v.strip())}
-        
+
+        template = {k: v for k, v in data.items() if v and ((isinstance(v, list) and len(v) > 0) or (isinstance(v, str) and v.strip()))}
+
         if not template:
             messagebox.showwarning("Предупреждение", "Нет данных для сохранения!")
             return
@@ -1751,7 +1760,7 @@ class RulesetBuilderGUI:
             created_files.append("exclude-domain-custom.rgx")
         
         if created_files:
-            self.log_msg(f"✅ Создано файлов: {len(created_files)}")
+            self.log_msg(f"Создано файлов: {len(created_files)}")
             messagebox.showinfo(
                 "Успех",
                 f"Входные файлы созданы!\n\n"
@@ -1828,10 +1837,10 @@ class RulesetBuilderGUI:
                 self.master.after(0, lambda: self.show_generation_result(result.returncode, output_dir))
                 
             except subprocess.TimeoutExpired:
-                self.log_msg("❌ Таймаут выполнения (>5 минут)")
+                self.log_msg("Таймаут выполнения (>5 минут)")
                 self.master.after(0, lambda: messagebox.showerror("Ошибка", "Таймаут выполнения!"))
             except Exception as e:
-                self.log_msg(f"❌ Ошибка: {str(e)}")
+                self.log_msg(f"Ошибка: {str(e)}")
                 self.master.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
         
         threading.Thread(target=run_generation, daemon=True).start()
@@ -1843,7 +1852,7 @@ class RulesetBuilderGUI:
         if returncode == 0:
             files = [f for f in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, f))]
             
-            self.log_msg(f"✅ Генерация завершена успешно!")
+            self.log_msg(f"Генерация завершена успешно!")
             self.log_msg(f"Создано файлов: {len(files)}")
             
             messagebox.showinfo(
@@ -1853,7 +1862,7 @@ class RulesetBuilderGUI:
                 f"Файлов: {len(files)}"
             )
         else:
-            self.log_msg(f"❌ Ошибка генерации (код {returncode})")
+            self.log_msg(f"Ошибка генерации (код {returncode})")
             messagebox.showerror("Ошибка", f"Генерация завершилась с ошибкой!\n\nПроверьте лог.")
     
     def open_geo_output_dir(self):
@@ -1913,7 +1922,7 @@ class RulesetBuilderGUI:
                 self.mihomo_ip_widget.delete('1.0', tk.END)
                 self.mihomo_ip_widget.insert(tk.END, '\n'.join(items))
             
-            self.log_msg(f"✅ Загружено {len(items)} записей")
+            self.log_msg(f"Загружено {len(items)} записей")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить файл:\n{str(e)}")
     
@@ -1976,13 +1985,13 @@ class RulesetBuilderGUI:
         
         ttk.Button(
             btn_frame,
-            text="📋 Копировать",
+            text="Копировать",
             command=lambda: [preview_window.clipboard_clear(), preview_window.clipboard_append(yaml_content)]
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Button(
             btn_frame,
-            text="✅ Закрыть",
+            text="Закрыть",
             command=preview_window.destroy
         ).pack(side=tk.LEFT, padx=5)
         
@@ -2014,7 +2023,7 @@ class RulesetBuilderGUI:
                 behavior = "classical"
         
         self.log_msg("=" * 60)
-        self.log_msg("🚀 Генерация .mrs файла для Mihomo...")
+        self.log_msg("Генерация .mrs файла для Mihomo...")
         self.log_msg(f"📝 Behavior type: {behavior}")
         self.log_msg(f"📊 Доменов: {len(domains)}, IP: {len(ips)}")
         
@@ -2037,7 +2046,7 @@ class RulesetBuilderGUI:
         success_yaml, msg_yaml, stats_yaml = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
         
         if success_yaml:
-            self.log_msg(f"✅ {msg_yaml}")
+            self.log_msg(f"{msg_yaml}")
             
             # Компилируем .mrs
             mrs_path = os.path.join(output_dir, f"{filename}.mrs")
@@ -2062,7 +2071,7 @@ class RulesetBuilderGUI:
             else:
                 messagebox.showerror("Ошибка", msg_mrs)
         else:
-            self.log_msg(f"❌ {msg_yaml}")
+            self.log_msg(f"{msg_yaml}")
             messagebox.showerror("Ошибка", msg_yaml)
         
         self.log_msg("=" * 60)
