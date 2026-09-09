@@ -15,4 +15,4 @@ if __name__ == "__main__":
 
     # Import and run the main application
     from ruleset_builder import main
-    main()
+    sys.exit(main())

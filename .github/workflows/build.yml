@@ -2,121 +2,99 @@ name: Build Ruleset Builder
 
 on:
   push:
-    branches: [ main, master ]
-    tags:
-      - 'v*'
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --onefile --windowed --name="RulesetBuilder" --icon=icon.ico main.py
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: RulesetBuilder-Windows
-        path: dist/RulesetBuilder.exe
-        
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: dist/RulesetBuilder.exe
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-linux:
+  test:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install GUI test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+          python -m pip install ruff
+      - name: Download pinned rule compilers
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ruleset-tools"
+          cd "$RUNNER_TEMP/ruleset-tools"
+          curl --retry 3 -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz -o sing-box.tar.gz
+          curl --retry 3 -fsSL https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-compatible-v1.19.30.gz -o mihomo.gz
+          echo '2375de6999f4f56ab46b4fc5ddf26a6aba1d3e61a0f4e7ddec2f4690457d5f63  sing-box.tar.gz' | sha256sum -c -
+          echo 'db214c7a2517e63c150d123178d16d102e03a241ccdae4e5e07ffbe9cf56c6f9  mihomo.gz' | sha256sum -c -
+          tar -xzf sing-box.tar.gz
+          gzip -d mihomo.gz
+          chmod +x mihomo
+          echo "SINGBOX_BINARY=$RUNNER_TEMP/ruleset-tools/sing-box-1.14.0-linux-amd64/sing-box" >> "$GITHUB_ENV"
+          echo "MIHOMO_BINARY=$RUNNER_TEMP/ruleset-tools/mihomo" >> "$GITHUB_ENV"
+      - name: Check Python errors
+        run: ruff check --select E9,F63,F7,F82 ruleset_builder.py main.py tests
+      - name: Test exports, matching and GUI
+        run: xvfb-run -a python -m unittest discover -s tests -v
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --onefile --name="RulesetBuilder" --icon=icon.png main.py
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: RulesetBuilder-Linux
-        path: dist/RulesetBuilder
-        
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: dist/RulesetBuilder
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-macos:
-    runs-on: macos-latest
-
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            artifact: dist/RulesetBuilder.exe
+          - os: ubuntu-latest
+            platform: Linux
+            artifact: dist/RulesetBuilder-Linux.tar.gz
+          - os: macos-latest
+            platform: macOS
+            artifact: dist/RulesetBuilder-macOS.zip
+    runs-on: ${{ matrix.os }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build dependencies
+        run: python -m pip install pyinstaller Pillow
+      - name: Test core and CLI
+        run: python -m unittest discover -s tests -p test_ruleset_builder.py -v
+      - name: Build with bundled icon
+        run: pyinstaller --noconfirm ruleset_builder.spec
+      - name: Package Linux executable
+        if: runner.os == 'Linux'
+        run: tar -czf dist/RulesetBuilder-Linux.tar.gz -C dist RulesetBuilder
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/RulesetBuilder.app dist/RulesetBuilder-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RulesetBuilder-${{ matrix.platform }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --onefile --windowed --name="RulesetBuilder" main.py
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: RulesetBuilder-macOS
-        path: dist/RulesetBuilder
-        
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: dist/RulesetBuilder
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

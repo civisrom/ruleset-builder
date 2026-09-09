@@ -63,17 +63,14 @@ def _set_icon(self, window):
 ```
 
 ### PyInstaller Build
-Icons are embedded in executables via `.github/workflows/build.yml`:
+Иконки подключаются через `ruleset_builder.spec`, который используется локально и в CI:
 
-**Windows:**
-```yaml
-pyinstaller --onefile --windowed --name="RulesetBuilder" --icon=icon.ico main.py
+```bash
+pyinstaller --noconfirm ruleset_builder.spec
 ```
 
-**Linux/macOS:**
-```yaml
-pyinstaller --onefile --name="RulesetBuilder" --icon=icon.png main.py
-```
+`icon.png` включается в ресурсы приложения для заголовка окна.
+Windows использует `icon.ico` для EXE, а macOS — PNG для создания иконки `.app`.
 
 ## Platform-Specific Notes
 

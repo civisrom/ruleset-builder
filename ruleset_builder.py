@@ -9,14 +9,19 @@ import argparse
 import os
 import sys
 import re
-import struct
+import ipaddress
+import queue
+import tempfile
 import shutil
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+except ImportError:
+    tk = None
 import subprocess
 import threading
 
@@ -55,348 +60,357 @@ TEMPLATES = {
 # УТИЛИТЫ ДЛЯ РАБОТЫ С ФАЙЛАМИ
 # ============================================================================
 
+DOMAIN_FIELDS = ('domain', 'domain_suffix', 'domain_keyword', 'domain_regex')
+IP_FIELDS = ('ip_cidr', 'source_ip_cidr')
+PROCESS_FIELDS = ('process_path_regex', 'package_name')
+NETWORK_TYPES = ('wifi', 'cellular', 'ethernet', 'other')
+NETWORK_FLAGS = ('network_is_expensive', 'network_is_constrained')
+
+
 class FileProcessor:
-    """Обработка больших файлов с прогресс-баром"""
-    
+    """Чтение UTF-8 списков и проверка входных данных."""
+
     @staticmethod
     def read_large_file(file_path: str, progress_callback=None) -> List[str]:
-        """Читает большой файл построчно с отчётом о прогрессе"""
-        if not file_path or not os.path.exists(file_path):
-            return []
-        
         lines = []
         file_size = os.path.getsize(file_path)
         bytes_read = 0
-        
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for original_line in f:
-                # Отслеживаем прогресс по оригинальной строке (с переносами)
+        last_progress = -1
+        with open(file_path, 'r', encoding='utf-8-sig') as file:
+            for original_line in file:
                 bytes_read += len(original_line.encode('utf-8'))
-                if progress_callback and file_size > 0:
-                    progress = min(int((bytes_read / file_size) * 100), 100)
+                progress = min(int(bytes_read * 100 / file_size), 100) if file_size else 100
+                if progress_callback and progress != last_progress:
                     progress_callback(progress)
-
+                    last_progress = progress
                 line = original_line.strip()
                 if line and not line.startswith('#'):
                     lines.append(line)
-        
+        if progress_callback and last_progress != 100:
+            progress_callback(100)
         return lines
-    
+
+    @staticmethod
+    def normalize_domain(domain: str, suffix=False, wildcard=False) -> str:
+        prefix = ''
+        if wildcard and domain.startswith('+.'):
+            prefix, domain = '+.', domain[2:]
+        elif (suffix or wildcard) and domain.startswith('.'):
+            prefix, domain = '.', domain[1:]
+        labels = []
+        for label in domain.split('.'):
+            if wildcard and label == '*':
+                labels.append(label)
+                continue
+            ascii_label = label.encode('idna').decode('ascii').lower()
+            if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', ascii_label):
+                raise ValueError(f'Некорректный домен: {prefix}{domain}')
+            labels.append(ascii_label)
+        normalized = '.'.join(labels)
+        if len(normalized) > 253:
+            raise ValueError('Домен длиннее 253 символов')
+        return prefix + normalized
+
     @staticmethod
     def validate_domain(domain: str) -> bool:
-        """Валидация доменного имени"""
-        pattern = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
-        return bool(re.match(pattern, domain.lstrip('.')))
-    
+        try:
+            FileProcessor.normalize_domain(domain, suffix=True)
+            return True
+        except (ValueError, UnicodeError):
+            return False
+
     @staticmethod
     def validate_ip_cidr(cidr: str) -> bool:
-        """Валидация IP CIDR"""
-        pattern = r'^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$'
-        if not re.match(pattern, cidr):
-            return False
-        
-        parts = cidr.split('/')
-        ip_parts = parts[0].split('.')
-        
-        if not all(0 <= int(p) <= 255 for p in ip_parts):
-            return False
-        
-        if len(parts) == 2 and not (0 <= int(parts[1]) <= 32):
-            return False
-        
-        return True
-    
-    @staticmethod
-    def validate_regex(pattern: str) -> bool:
-        """Валидация регулярного выражения"""
         try:
-            re.compile(pattern)
+            if '%' in cidr:
+                return False
+            ipaddress.ip_network(cidr, strict=False)
             return True
-        except re.error:
+        except ValueError:
             return False
 
-# ============================================================================
-# ГЕНЕРАЦИЯ RULESET
-# ============================================================================
+    @staticmethod
+    def normalize_data(data: Dict) -> Dict:
+        """Проверяет схему поддерживаемых полей без изменения смысла условий."""
+        if not isinstance(data, dict):
+            raise ValueError('Шаблон должен содержать JSON-объект')
+        known = set(DOMAIN_FIELDS + IP_FIELDS + PROCESS_FIELDS + NETWORK_FLAGS)
+        known.update(('network_type', 'network_interface_address', 'default_interface_address'))
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError('Неизвестные поля: ' + ', '.join(sorted(unknown)))
+        normalized = {}
+        for key in DOMAIN_FIELDS + IP_FIELDS + PROCESS_FIELDS + ('default_interface_address',):
+            values = data.get(key, [])
+            if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(f'{key}: ожидается список непустых строк')
+            cleaned = []
+            for index, value in enumerate(values, 1):
+                value = value.strip()
+                try:
+                    if key in ('domain', 'domain_suffix'):
+                        value = FileProcessor.normalize_domain(value, suffix=(key == 'domain_suffix'))
+                    elif key in IP_FIELDS + ('default_interface_address',):
+                        if not FileProcessor.validate_ip_cidr(value):
+                            raise ValueError('некорректный IPv4/IPv6 адрес или CIDR')
+                        value = str(ipaddress.ip_network(value, strict=False))
+                except (ValueError, UnicodeError) as error:
+                    raise ValueError(f'{key}, запись {index}: {error}') from error
+                cleaned.append(value)
+            if cleaned:
+                normalized[key] = list(dict.fromkeys(cleaned))
+        network_type = data.get('network_type', '')
+        if network_type:
+            types = [network_type] if isinstance(network_type, str) else network_type
+            if not isinstance(types, list) or any(value not in NETWORK_TYPES for value in types):
+                raise ValueError('network_type: допустимы wifi, cellular, ethernet, other')
+            normalized['network_type'] = list(dict.fromkeys(types))
+        for key in NETWORK_FLAGS:
+            value = data.get(key, False)
+            if type(value) is not bool and (not isinstance(value, str) or value not in ('true', 'false')):
+                raise ValueError(f'{key}: ожидается true или false')
+            if value is True or value == 'true':
+                normalized[key] = True
+        interfaces = data.get('network_interface_address', {})
+        if not isinstance(interfaces, dict):
+            raise ValueError('network_interface_address: требуется объект с типами сети и списками CIDR')
+        if interfaces:
+            normalized['network_interface_address'] = {}
+            for name, addresses in interfaces.items():
+                if name not in NETWORK_TYPES or not isinstance(addresses, list) or not addresses:
+                    raise ValueError('Адреса интерфейсов: укажите тип сети и непустой список CIDR')
+                for address in addresses:
+                    if not isinstance(address, str) or not FileProcessor.validate_ip_cidr(address):
+                        raise ValueError(f'Некорректный адрес интерфейса {name}: {address}')
+                normalized['network_interface_address'][name] = list(dict.fromkeys(
+                    str(ipaddress.ip_network(address, strict=False)) for address in addresses))
+        return normalized
+
 
 class RulesetGenerator:
-    """Генератор ruleset для различных форматов"""
-    
+    """Генератор ruleset для Sing-box и Mihomo."""
+
     @staticmethod
     def is_non_empty(value: Any) -> bool:
-        """Проверка на непустое значение"""
-        if isinstance(value, list):
-            return len(value) > 0
-        if isinstance(value, str):
-            return value.strip() != ""
-        return value is not None and value is not False
-    
+        return bool(value) and value != 'false'
+
     @staticmethod
-    def generate_singbox_json(data: Dict, output_path: str) -> Tuple[bool, str, Dict]:
-        """Генерация JSON для Sing-Box"""
-        rules = []
+    def build_singbox_ruleset(data: Dict) -> Tuple[Dict, Dict]:
+        data = FileProcessor.normalize_data(data)
+        if not data:
+            raise ValueError('Нет данных для создания ruleset')
+        # Поля — независимые альтернативы (ИЛИ). Внутри поля значения тоже объединяются по ИЛИ.
+        rules = [{key: value} for key, value in data.items()]
+        version = 1
+        if data.get('process_path_regex'):
+            version = 2
+        if any(key in data for key in ('network_type',) + NETWORK_FLAGS):
+            version = 3
+        if any(key in data for key in ('network_interface_address', 'default_interface_address')):
+            version = 4
         stats = {'total': 0, 'domains': 0, 'ips': 0, 'processes': 0, 'network': 0}
-        
-        # Domain правила
-        domain_rule = {}
-        for key in ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex']:
-            if key in data and RulesetGenerator.is_non_empty(data[key]):
-                domain_rule[key] = data[key]
-                stats['domains'] += len(data[key])
-        
-        if domain_rule:
-            rules.append(domain_rule)
-        
-        # IP правила
-        ip_rule = {}
-        for key in ['ip_cidr', 'source_ip_cidr']:
-            if key in data and RulesetGenerator.is_non_empty(data[key]):
-                ip_rule[key] = data[key]
-                stats['ips'] += len(data[key])
-        
-        if ip_rule:
-            rules.append(ip_rule)
-        
-        # Process правила
-        process_rule = {}
-        for key in ['process_path_regex', 'package_name']:
-            if key in data and RulesetGenerator.is_non_empty(data[key]):
-                process_rule[key] = data[key]
-                stats['processes'] += len(data[key]) if isinstance(data[key], list) else 1
-        
-        if process_rule:
-            rules.append(process_rule)
-        
-        # Network правила
-        network_rule = {}
-        for key in ['network_type', 'network_interface_address', 'default_interface_address']:
-            if key in data and RulesetGenerator.is_non_empty(data[key]):
-                network_rule[key] = data[key]
-                stats['network'] += 1
-        
-        for key in ['network_is_expensive', 'network_is_constrained']:
-            if key in data and data[key] == 'true':
-                network_rule[key] = True
-                stats['network'] += 1
-        
-        if network_rule:
-            rules.append(network_rule)
-        
-        # Формирование ruleset
-        ruleset = {
-            "version": 1,
-            "rules": rules
-        }
-        
+        for key, value in data.items():
+            group = 'domains' if key in DOMAIN_FIELDS else 'ips' if key in IP_FIELDS else 'processes' if key in PROCESS_FIELDS else 'network'
+            stats[group] += len(value) if isinstance(value, list) else 1
+        stats['total'] = sum(stats.values())
+        return {'version': version, 'rules': rules}, stats
+
+    @staticmethod
+    def write_text(output_path: str, content: str):
+        """Атомарная замена: ошибка записи не повреждает прежний ruleset."""
+        output = Path(output_path).absolute()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
         try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(ruleset, f, indent=2, ensure_ascii=False)
-            
-            stats['total'] = sum(stats.values())
-            return True, f"JSON сохранён: {os.path.basename(output_path)}", stats
-        except Exception as e:
-            return False, f"Ошибка сохранения: {str(e)}", stats
-    
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='\n',
+                                             dir=output.parent, suffix='.tmp', delete=False) as file:
+                temporary = Path(file.name)
+                file.write(content)
+            os.replace(temporary, output)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def generate_singbox_json(data: Dict, output_path: str, singbox_path: str = '') -> Tuple[bool, str, Dict]:
+        stats = {'total': 0, 'domains': 0, 'ips': 0, 'processes': 0, 'network': 0}
+        try:
+            ruleset, stats = RulesetGenerator.build_singbox_ruleset(data)
+            content = json.dumps(ruleset, indent=2, ensure_ascii=False) + '\n'
+            # Python re и Go regexp несовместимы: регулярные выражения проверяет сам Sing-box.
+            if singbox_path or data.get('domain_regex') or data.get('process_path_regex'):
+                if not singbox_path:
+                    raise ValueError('Для проверки регулярных выражений укажите путь к Sing-box')
+                with tempfile.TemporaryDirectory(prefix='ruleset-check-') as directory:
+                    source = Path(directory) / 'rules.json'
+                    source.write_text(content, encoding='utf-8')
+                    success, message = RulesetGenerator.check_singbox(singbox_path, str(source))
+                    if not success:
+                        raise ValueError(message)
+            RulesetGenerator.write_text(output_path, content)
+            return True, f'JSON сохранён: {Path(output_path).name}', stats
+        except (OSError, ValueError, TypeError) as error:
+            return False, f'Ошибка создания JSON: {error}', stats
+
+    @staticmethod
+    def resolve_executable(executable: str) -> str:
+        resolved = shutil.which(executable) if executable else None
+        if resolved is None:
+            raise ValueError(f'Исполняемый файл не найден: {executable or "путь не задан"}')
+        return str(Path(resolved).absolute())
+
+    @staticmethod
+    def _compile(executable: str, source_path: str, output_path: str, arguments: List[str]) -> Tuple[bool, str]:
+        try:
+            executable = RulesetGenerator.resolve_executable(executable)
+            source = Path(source_path).absolute()
+            output = Path(output_path).absolute()
+            if not source.is_file():
+                raise ValueError(f'Исходный файл не найден: {source}')
+            if source == output:
+                raise ValueError('Исходный и выходной файлы должны различаться')
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.ruleset-', dir=output.parent) as directory:
+                target = Path(directory) / output.name
+                cmd = [executable] + [str(source) if arg == '{source}' else str(target) if arg == '{output}' else arg for arg in arguments]
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                        timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                if result.returncode:
+                    return False, 'Ошибка компиляции: ' + (result.stderr.strip() or result.stdout.strip() or str(result.returncode))
+                if not target.is_file() or target.stat().st_size == 0:
+                    return False, 'Компилятор не создал непустой выходной файл'
+                size = target.stat().st_size
+                os.replace(target, output)
+            return True, f'Создан {output.name} ({size} байт)'
+        except subprocess.TimeoutExpired:
+            return False, 'Таймаут компиляции (>60 сек)'
+        except (OSError, ValueError) as error:
+            return False, f'Ошибка запуска: {error}'
+
+    @staticmethod
+    def check_singbox(singbox_path: str, json_path: str) -> Tuple[bool, str]:
+        """Загрузка правил движком: compile сам по себе не проверяет Go regexp."""
+        try:
+            executable = RulesetGenerator.resolve_executable(singbox_path)
+            with tempfile.TemporaryDirectory(prefix='ruleset-validate-') as directory:
+                config = Path(directory) / 'config.json'
+                config.write_text(json.dumps({'route': {'rule_set': [
+                    {'tag': 'validation', 'type': 'local', 'format': 'source', 'path': str(Path(json_path).absolute())}
+                ]}}), encoding='utf-8')
+                result = subprocess.run([executable, '--disable-color', 'check', '--config', str(config)],
+                                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if result.returncode:
+                return False, 'Sing-box отклонил правила: ' + (result.stderr.strip() or result.stdout.strip())
+            return True, 'Правила проверены движком Sing-box'
+        except subprocess.TimeoutExpired:
+            return False, 'Таймаут проверки Sing-box (>60 сек)'
+        except (OSError, ValueError) as error:
+            return False, f'Ошибка проверки Sing-box: {error}'
+
     @staticmethod
     def compile_srs(singbox_path: str, json_path: str) -> Tuple[bool, str]:
-        """Компиляция .srs файла через sing-box"""
-        if not os.path.exists(singbox_path):
-            return False, "sing-box не найден!"
-        
-        cmd = [singbox_path, "rule-set", "compile", json_path]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=os.path.dirname(singbox_path),
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                srs_path = json_path.replace(".json", ".srs")
-                if os.path.exists(srs_path):
-                    size = os.path.getsize(srs_path)
-                    return True, f".srs создан: {os.path.basename(srs_path)} ({size} байт)"
-                else:
-                    return False, "Команда выполнена, но .srs не найден"
-            else:
-                return False, f"Ошибка компиляции: {result.stderr.strip()}"
-        except subprocess.TimeoutExpired:
-            return False, "Таймаут компиляции (>30 сек)"
-        except Exception as e:
-            return False, f"Ошибка запуска: {str(e)}"
-    
+        success, message = RulesetGenerator.check_singbox(singbox_path, json_path)
+        if not success:
+            return False, message
+        return RulesetGenerator._compile(singbox_path, json_path, str(Path(json_path).with_suffix('.srs')),
+                                         ['rule-set', 'compile', '--output', '{output}', '{source}'])
+
     @staticmethod
-    def generate_mihomo_yaml(data: Dict, output_path: str) -> Tuple[bool, str, Dict]:
-        """
-        Генерация YAML файла для Mihomo (промежуточный формат)
-        Этот файл затем конвертируется в .mrs через mihomo.exe
-        """
-        try:
-            stats = {'total': 0, 'domains': 0, 'ips': 0}
-            
-            payload = []
-            
-            # Определяем тип behavior на основе данных
-            has_domains = any(data.get(k) for k in ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex'])
-            has_ips = any(data.get(k) for k in ['ip_cidr', 'source_ip_cidr'])
-            
-            # Для domain behavior - используем формат с точками (БЕЗ КАВЫЧЕК!)
-            if has_domains and not has_ips:
-                # domain behavior - используем wildcard формат
-                if 'domain' in data and RulesetGenerator.is_non_empty(data['domain']):
-                    for domain in data['domain']:
-                        payload.append(domain)
-                        stats['domains'] += 1
-                
-                if 'domain_suffix' in data and RulesetGenerator.is_non_empty(data['domain_suffix']):
-                    for suffix in data['domain_suffix']:
-                        # Для domain behavior используем формат с точкой впереди
-                        suffix_clean = suffix.lstrip('.')
-                        payload.append(f".{suffix_clean}")
-                        stats['domains'] += 1
-                
-                if 'domain_keyword' in data and RulesetGenerator.is_non_empty(data['domain_keyword']):
-                    for keyword in data['domain_keyword']:
-                        # Для keywords используем wildcard
-                        payload.append(f"*.{keyword}.*")
-                        stats['domains'] += 1
-            
-            # Для ipcidr behavior - только IP адреса (БЕЗ КАВЫЧЕК!)
-            elif has_ips and not has_domains:
-                # ipcidr behavior - чистые IP адреса
-                if 'ip_cidr' in data and RulesetGenerator.is_non_empty(data['ip_cidr']):
-                    for cidr in data['ip_cidr']:
-                        payload.append(cidr)
-                        stats['ips'] += 1
-                
-                if 'source_ip_cidr' in data and RulesetGenerator.is_non_empty(data['source_ip_cidr']):
-                    for cidr in data['source_ip_cidr']:
-                        payload.append(cidr)
-                        stats['ips'] += 1
-            
-            # Для classical behavior - используем полный формат с префиксами
-            else:
-                # classical behavior - полный формат правил
-                if 'domain' in data and RulesetGenerator.is_non_empty(data['domain']):
-                    for domain in data['domain']:
-                        payload.append(f"DOMAIN,{domain}")
-                        stats['domains'] += 1
-                
-                if 'domain_suffix' in data and RulesetGenerator.is_non_empty(data['domain_suffix']):
-                    for suffix in data['domain_suffix']:
-                        suffix_clean = suffix.lstrip('.')
-                        payload.append(f"DOMAIN-SUFFIX,{suffix_clean}")
-                        stats['domains'] += 1
-                
-                if 'domain_keyword' in data and RulesetGenerator.is_non_empty(data['domain_keyword']):
-                    for keyword in data['domain_keyword']:
-                        payload.append(f"DOMAIN-KEYWORD,{keyword}")
-                        stats['domains'] += 1
-                
-                if 'ip_cidr' in data and RulesetGenerator.is_non_empty(data['ip_cidr']):
-                    for cidr in data['ip_cidr']:
-                        payload.append(f"IP-CIDR,{cidr}")
-                        stats['ips'] += 1
-                
-                if 'source_ip_cidr' in data and RulesetGenerator.is_non_empty(data['source_ip_cidr']):
-                    for cidr in data['source_ip_cidr']:
-                        payload.append(f"SRC-IP-CIDR,{cidr}")
-                        stats['ips'] += 1
-            
-            if not payload:
-                return False, "Нет данных для создания ruleset", stats
-            
-            # Создаём YAML структуру в правильном формате (БЕЗ КАВЫЧЕК!)
-            yaml_content = "payload:\n"
-            for rule in payload:
-                yaml_content += f"  - {rule}\n"
-            
-            # Сохраняем YAML файл
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(yaml_content)
-            
-            stats['total'] = len(payload)
-            return True, f"YAML для Mihomo создан: {os.path.basename(output_path)}", stats
-        
-        except Exception as e:
-            return False, f"Ошибка создания YAML: {str(e)}", {'total': 0}
-    
+    def build_mihomo_yaml(data: Dict, behavior_type: str = 'auto') -> Tuple[str, str, Dict]:
+        if not isinstance(data, dict):
+            raise ValueError('Ожидается объект с полями правил')
+        unsupported = [key for key, value in data.items()
+                       if key not in ('domain', 'domain_suffix', 'ip_cidr') and RulesetGenerator.is_non_empty(value)]
+        if unsupported:
+            raise ValueError('MRS не поддерживает поля: ' + ', '.join(unsupported) + '. Используйте Sing-box JSON/SRS.')
+        domains = []
+        for key in ('domain', 'domain_suffix'):
+            values = data.get(key, [])
+            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                raise ValueError(f'{key}: ожидается список строк')
+            for value in values:
+                value = FileProcessor.normalize_domain(value.strip(), suffix=(key == 'domain_suffix'), wildcard=(key == 'domain'))
+                # Sing-box: .example.com — только поддомены; example.com — также корневой домен.
+                if key == 'domain_suffix' and not value.startswith('.'):
+                    value = '+.' + value
+                domains.append(value)
+        ips = data.get('ip_cidr', [])
+        if not isinstance(ips, list) or any(not isinstance(value, str) or not FileProcessor.validate_ip_cidr(value) for value in ips):
+            raise ValueError('ip_cidr: некорректный список IPv4/IPv6 адресов или CIDR')
+        if domains and ips:
+            raise ValueError('Один MRS не может содержать домены и IP. Создайте два отдельных набора domain и ipcidr.')
+        if not domains and not ips:
+            raise ValueError('Нет данных для создания MRS')
+        behavior = 'domain' if domains else 'ipcidr'
+        if behavior_type not in ('auto', behavior):
+            raise ValueError(f'MRS поддерживает только domain и ipcidr; для этих данных нужен {behavior}')
+        payload = list(dict.fromkeys(domains if domains else [str(ipaddress.ip_network(value, strict=False)) for value in ips]))
+        # JSON-строки допустимы в YAML и защищают *, #, true, null и прочие специальные значения.
+        content = 'payload:\n' + ''.join('  - ' + json.dumps(value, ensure_ascii=False) + '\n' for value in payload)
+        stats = {'total': len(payload), 'domains': len(payload) if domains else 0, 'ips': len(payload) if ips else 0}
+        return content, behavior, stats
+
     @staticmethod
-    def compile_mrs(mihomo_path: str, yaml_path: str, output_path: str, behavior_type: str = "domain") -> Tuple[bool, str]:
-        """Компиляция .mrs файла через mihomo.exe
-        
-        Args:
-            mihomo_path: путь к mihomo.exe
-            yaml_path: путь к исходному YAML файлу
-            output_path: путь для выходного .mrs файла
-            behavior_type: тип поведения - 'domain', 'ipcidr' или 'classical'
-        """
-        if not os.path.exists(mihomo_path):
-            return False, "mihomo.exe не найден!"
-        
-        if not os.path.exists(yaml_path):
-            return False, f"Исходный YAML файл не найден: {yaml_path}"
-        
-        # Получаем имена файлов и директорию вывода
-        output_dir = os.path.dirname(os.path.abspath(output_path))
-        yaml_filename = os.path.basename(yaml_path)
-        output_filename = os.path.basename(output_path)
-        
-        # Копируем YAML в директорию вывода если он не там
-        yaml_in_output = os.path.join(output_dir, yaml_filename)
-        if os.path.abspath(yaml_path) != os.path.abspath(yaml_in_output):
-            shutil.copy2(yaml_path, yaml_in_output)
-            yaml_to_use = yaml_in_output
-            cleanup_yaml = True
-        else:
-            yaml_to_use = yaml_path
-            cleanup_yaml = False
-        
-        # Правильная команда mihomo:
-        # mihomo convert-ruleset <behavior> <format> <input-file> <output-file>
-        # где format = "yaml", behavior = "domain"/"ipcidr"/"classical"
-        cmd = [
-            os.path.abspath(mihomo_path), 
-            "convert-ruleset", 
-            behavior_type,      # domain/ipcidr/classical
-            "yaml",             # формат ВХОДНОГО файла (не mrs!)
-            yaml_filename,      # входной файл (относительный путь)
-            output_filename     # выходной файл (относительный путь)
-        ]
-        
+    def generate_mihomo_yaml(data: Dict, output_path: str, behavior_type: str = 'auto') -> Tuple[bool, str, Dict]:
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=output_dir,  # Запускаем из директории вывода
-                timeout=30
-            )
-            
-            # Удаляем временный YAML если создавали
-            if cleanup_yaml and os.path.exists(yaml_in_output):
-                try:
-                    os.remove(yaml_in_output)
-                except (OSError, PermissionError) as e:
-                    # Игнорируем ошибки удаления временного файла
-                    pass
-            
-            if result.returncode == 0:
-                if os.path.exists(output_path):
-                    size = os.path.getsize(output_path)
-                    return True, f".mrs создан: {os.path.basename(output_path)} ({size} байт)"
-                else:
-                    return False, "Команда выполнена, но .mrs файл не найден"
-            else:
-                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
-                return False, f"Ошибка компиляции Mihomo: {error_msg}"
-        
-        except subprocess.TimeoutExpired:
-            return False, "Таймаут компиляции (>30 сек)"
-        except Exception as e:
-            return False, f"Ошибка запуска mihomo.exe: {str(e)}"
+            content, _, stats = RulesetGenerator.build_mihomo_yaml(data, behavior_type)
+            RulesetGenerator.write_text(output_path, content)
+            return True, f'YAML сохранён: {Path(output_path).name}', stats
+        except (OSError, ValueError, TypeError) as error:
+            return False, f'Ошибка создания YAML: {error}', {'total': 0}
+
+    @staticmethod
+    def compile_mrs(mihomo_path: str, yaml_path: str, output_path: str, behavior_type: str = 'domain') -> Tuple[bool, str]:
+        if behavior_type not in ('domain', 'ipcidr'):
+            return False, 'MRS поддерживает только domain и ipcidr'
+        return RulesetGenerator._compile(mihomo_path, yaml_path, output_path,
+                                         ['convert-ruleset', behavior_type, 'yaml', '{source}', '{output}'])
+
+    @staticmethod
+    def export(data: Dict, output_base: str, formats, singbox_path='', mihomo_path='', validate=False,
+               behavior_type='auto') -> Tuple[bool, List[str]]:
+        """Общий путь экспорта для GUI и CLI с предварительной проверкой всех форматов."""
+        messages = []
+        try:
+            formats = set(formats)
+            if not formats or formats - {'json', 'srs', 'mrs'}:
+                raise ValueError('Выберите JSON, SRS или MRS')
+            base = Path(output_base).absolute()
+            if base.suffix.lower() in ('.json', '.srs', '.mrs'):
+                base = base.with_suffix('')
+            needs_singbox = bool(formats & {'json', 'srs'})
+            if needs_singbox:
+                RulesetGenerator.build_singbox_ruleset(data)
+                if 'srs' in formats or validate or data.get('domain_regex') or data.get('process_path_regex'):
+                    singbox_path = RulesetGenerator.resolve_executable(singbox_path)
+            if 'mrs' in formats:
+                yaml_content, behavior, _ = RulesetGenerator.build_mihomo_yaml(data, behavior_type)
+                mihomo_path = RulesetGenerator.resolve_executable(mihomo_path)
+            if needs_singbox:
+                json_path = str(base) + '.json'
+                check_path = singbox_path if validate or data.get('domain_regex') or data.get('process_path_regex') else ''
+                success, message, _ = RulesetGenerator.generate_singbox_json(data, json_path, check_path)
+                messages.append(message)
+                if not success:
+                    return False, messages
+                if 'srs' in formats:
+                    success, message = RulesetGenerator.compile_srs(singbox_path, json_path)
+                    messages.append(message)
+                    if not success:
+                        return False, messages
+            if 'mrs' in formats:
+                yaml_path = str(base) + '_mihomo.yaml'
+                RulesetGenerator.write_text(yaml_path, yaml_content)
+                messages.append(f'YAML сохранён: {Path(yaml_path).name}; behavior: {behavior}')
+                success, message = RulesetGenerator.compile_mrs(mihomo_path, yaml_path, str(base) + '.mrs', behavior)
+                messages.append(message)
+                if not success:
+                    return False, messages
+            return True, messages
+        except (OSError, ValueError, TypeError) as error:
+            messages.append(str(error))
+            return False, messages
 
 # ============================================================================
 # GUI ПРИЛОЖЕНИЕ
@@ -422,7 +436,7 @@ class RulesetBuilderGUI:
         self.output_format = tk.StringVar(value="json")
         self.compile_srs = tk.BooleanVar(value=False)
         self.generate_mrs = tk.BooleanVar(value=False)
-        self.validate_input = tk.BooleanVar(value=True)
+        self.validate_input = tk.BooleanVar(value=False)
         
         # Виджеты для категорий
         self.domain_widgets = {}
@@ -448,23 +462,23 @@ class RulesetBuilderGUI:
         # Словарь категорий для GeoIP/GeoSite
         self.geo_categories = {}
         
+        self._ui_events = queue.Queue()
+        self._busy = False
+        self._closed = False
+        self._disabled_widgets = []
+        self.status_text = tk.StringVar(value="Готово")
         self.setup_ui()
         self.apply_theme()
+        master.protocol('WM_DELETE_WINDOW', self.on_close)
+        self._poll_id = master.after(50, self.poll_tasks)
     
     def setup_ui(self):
-        """Создание интерфейса"""
-        # Главный контейнер
+        """Панель состояния всегда видна, вкладки занимают оставшееся место."""
         main_frame = ttk.Frame(self.master, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Верхняя панель
         self.setup_top_panel(main_frame)
-        
-        # Вкладки с правилами
-        self.setup_tabs(main_frame)
-        
-        # Нижняя панель с кнопками
         self.setup_bottom_panel(main_frame)
+        self.setup_tabs(main_frame)
     
     def setup_top_panel(self, parent):
         """Верхняя панель с настройками"""
@@ -521,8 +535,8 @@ class RulesetBuilderGUI:
         
         # Папка вывода
         row += 1
-        ttk.Label(top_frame, text="Папка:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(top_frame, textvariable=self.output_dir, width=50, state='readonly').grid(
+        ttk.Label(top_frame, text="Папка вывода:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(top_frame, textvariable=self.output_dir, width=50).grid(
             row=row, column=1, columnspan=2, sticky=tk.EW, padx=5
         )
         ttk.Button(top_frame, text="...", command=self.browse_output_dir, width=3).grid(
@@ -536,19 +550,19 @@ class RulesetBuilderGUI:
         
         ttk.Checkbutton(
             options_frame,
-            text="Компилировать .srs",
+            text="Дополнительно SRS",
             variable=self.compile_srs
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Checkbutton(
             options_frame,
-            text="Генерировать .mrs (Mihomo)",
+            text="Дополнительно MRS",
             variable=self.generate_mrs
         ).pack(side=tk.LEFT, padx=5)
         
         ttk.Checkbutton(
             options_frame,
-            text="Валидация входных данных",
+            text="Проверять JSON через Sing-box",
             variable=self.validate_input
         ).pack(side=tk.LEFT, padx=5)
         
@@ -558,66 +572,33 @@ class RulesetBuilderGUI:
         top_frame.columnconfigure(3, weight=0)
     
     def setup_tabs(self, parent):
-        """Создание вкладок с правилами"""
-        # Фрейм для кнопок действий (правый верхний угол)
-        action_btn_frame = ttk.Frame(parent)
-        action_btn_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # Спейсер слева для выравнивания кнопок вправо
-        ttk.Label(action_btn_frame, text="").pack(side=tk.LEFT, expand=True)
-        
-        # Кнопки действий справа
-        ttk.Button(
-            action_btn_frame,
-            text="Генерировать Ruleset",
-            command=self.generate_ruleset,
-            style='Accent.TButton'
-        ).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(
-            action_btn_frame,
-            text="Очистить всё",
-            command=self.clear_all
-        ).pack(side=tk.LEFT, padx=5)
-        
-        notebook = ttk.Notebook(parent)
-        notebook.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        # Вкладка Domains
-        self.domain_frame = self.create_domain_tab(notebook)
-        notebook.add(self.domain_frame, text="Domains")
-        
-        # Вкладка IPs
-        self.ip_frame = self.create_ip_tab(notebook)
-        notebook.add(self.ip_frame, text="IP Addresses")
-        
-        # Вкладка Process
-        self.process_frame = self.create_process_tab(notebook)
-        notebook.add(self.process_frame, text="Processes")
-        
-        # Вкладка Network
-        self.network_frame = self.create_network_tab(notebook)
-        notebook.add(self.network_frame, text="Network")
-        
-        # НОВАЯ вкладка Mihomo
-        self.mihomo_frame = self.create_mihomo_tab(notebook)
-        notebook.add(self.mihomo_frame, text="Mihomo Rules")
-        
-        # Вкладка Шаблоны
-        self.templates_frame = self.create_templates_tab(notebook)
-        notebook.add(self.templates_frame, text="Шаблоны")
-        
-        # Вкладка Превью
-        self.preview_frame = self.create_preview_tab(notebook)
-        notebook.add(self.preview_frame, text="Превью")
-    
-        # Вкладка GeoIP/GeoSite
-        self.geoip_frame = self.create_geoip_geosite_tab(notebook)
-        notebook.add(self.geoip_frame, text="GeoIP/GeoSite")
-        
-        # Вкладка лога
-        self.log_frame = self.create_log_tab(notebook)
-        notebook.add(self.log_frame, text="Лог событий")
+        """Создание вкладок и прокрутки длинных форм."""
+        action_frame = ttk.Frame(parent)
+        action_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(action_frame, text="Поля объединяются по ИЛИ; пустые поля пропускаются.").pack(side=tk.LEFT)
+        ttk.Button(action_frame, text="Очистить всё", command=self.clear_all).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(action_frame, text="Создать ruleset", command=self.generate_ruleset,
+                   style='Accent.TButton').pack(side=tk.RIGHT, padx=5)
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        tabs = [
+            ('domain_frame', self.create_domain_tab, 'Домены', True),
+            ('ip_frame', self.create_ip_tab, 'IP-адреса', True),
+            ('process_frame', self.create_process_tab, 'Процессы', True),
+            ('network_frame', self.create_network_tab, 'Сеть', True),
+            ('mihomo_frame', self.create_mihomo_tab, 'Mihomo', True),
+            ('templates_frame', self.create_templates_tab, 'Шаблоны', True),
+            ('preview_frame', self.create_preview_tab, 'Превью', False),
+            ('geoip_frame', self.create_geoip_geosite_tab, 'GeoIP/GeoSite', True),
+            ('log_frame', self.create_log_tab, 'Журнал', False),
+        ]
+        for name, builder, title, scroll in tabs:
+            frame = self.scrollable_tab(builder) if scroll else builder(self.notebook)
+            setattr(self, name, frame)
+            self.notebook.add(frame, text=title)
+        for widgets in (self.domain_widgets, self.ip_widgets, self.process_widgets):
+            for widget in widgets.values():
+                self.bind_counter(widget['text'], widget['count'])
     
     def create_domain_tab(self, parent):
         """Вкладка доменов"""
@@ -630,17 +611,20 @@ class RulesetBuilderGUI:
             ('domain_regex', "Регулярные выражения (DOMAIN-REGEX):", "^stun\\..+\n.*\\.torrent$", False)
         ]
         
+        for column in range(2):
+            frame.columnconfigure(column, weight=1, uniform='domain')
+            frame.rowconfigure(column, weight=1)
         for i, (key, label, placeholder, validate) in enumerate(fields):
             field_frame = ttk.LabelFrame(frame, text=label, padding=5)
-            field_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+            field_frame.grid(row=i // 2, column=i % 2, sticky=tk.NSEW, padx=4, pady=5)
             
-            text_widget = scrolledtext.ScrolledText(field_frame, height=3, width=70, wrap=tk.WORD)
-            text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-            text_widget.insert(tk.END, f"# {placeholder}")
-            text_widget.bind('<KeyRelease>', lambda e, k=key: self.on_text_change(k))
+            text_widget = scrolledtext.ScrolledText(field_frame, height=3, width=30, wrap=tk.WORD)
+            text_widget.insert(tk.END, "\n".join("# " + line for line in placeholder.splitlines()))
+
             
             btn_frame = ttk.Frame(field_frame)
             btn_frame.pack(side=tk.RIGHT, fill=tk.Y)
+            text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
             
             ttk.Button(btn_frame, text="Файл", command=lambda k=key: self.load_file(k, 'domain'), width=10).pack(fill=tk.X, pady=2)
             ttk.Button(btn_frame, text="Очистить", command=lambda w=text_widget: self.clear_widget(w), width=10).pack(fill=tk.X, pady=2)
@@ -673,8 +657,8 @@ class RulesetBuilderGUI:
             
             text_widget = scrolledtext.ScrolledText(field_frame, height=5, width=70, wrap=tk.WORD)
             text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-            text_widget.insert(tk.END, f"# {placeholder}")
-            text_widget.bind('<KeyRelease>', lambda e, k=key: self.on_text_change(k))
+            text_widget.insert(tk.END, "\n".join("# " + line for line in placeholder.splitlines()))
+
             
             btn_frame = ttk.Frame(field_frame)
             btn_frame.pack(side=tk.RIGHT, fill=tk.Y)
@@ -704,7 +688,7 @@ class RulesetBuilderGUI:
         text1 = scrolledtext.ScrolledText(field_frame1, height=5, width=70, wrap=tk.WORD)
         text1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         text1.insert(tk.END, "# ^C:\\\\Program Files\\\\Chrome\\\\chrome\\.exe$\n# /usr/bin/firefox")
-        text1.bind('<KeyRelease>', lambda e: self.on_text_change('process_path_regex'))
+
         
         btn_frame1 = ttk.Frame(field_frame1)
         btn_frame1.pack(side=tk.RIGHT, fill=tk.Y)
@@ -721,7 +705,7 @@ class RulesetBuilderGUI:
         text2 = scrolledtext.ScrolledText(field_frame2, height=5, width=70, wrap=tk.WORD)
         text2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         text2.insert(tk.END, "# com.example.app\n# org.telegram.messenger")
-        text2.bind('<KeyRelease>', lambda e: self.on_text_change('package_name'))
+
         
         btn_frame2 = ttk.Frame(field_frame2)
         btn_frame2.pack(side=tk.RIGHT, fill=tk.Y)
@@ -746,11 +730,11 @@ class RulesetBuilderGUI:
         type_frame = ttk.LabelFrame(frame, text="Network Type:", padding=10)
         type_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(type_frame, text="Тип сети:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(type_frame, text="Типы сети (через запятую):").grid(row=0, column=0, sticky=tk.W, pady=5)
         network_combo = ttk.Combobox(
             type_frame,
             values=["", "wifi", "cellular", "ethernet", "other"],
-            state="readonly",
+            state="normal",
             width=20
         )
         network_combo.grid(row=0, column=1, sticky=tk.W, padx=10)
@@ -761,23 +745,23 @@ class RulesetBuilderGUI:
         
         ttk.Label(bool_frame, text="Expensive Network:").grid(row=0, column=0, sticky=tk.W, pady=5)
         exp_var = tk.StringVar(value="false")
-        ttk.Radiobutton(bool_frame, text="True", variable=exp_var, value="true").grid(row=0, column=1, sticky=tk.W, padx=5)
-        ttk.Radiobutton(bool_frame, text="False", variable=exp_var, value="false").grid(row=0, column=2, sticky=tk.W, padx=5)
+        ttk.Radiobutton(bool_frame, text="Да", variable=exp_var, value="true").grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Radiobutton(bool_frame, text="Не учитывать", variable=exp_var, value="false").grid(row=0, column=2, sticky=tk.W, padx=5)
         
         ttk.Label(bool_frame, text="Constrained (iOS):").grid(row=1, column=0, sticky=tk.W, pady=5)
         con_var = tk.StringVar(value="false")
-        ttk.Radiobutton(bool_frame, text="True", variable=con_var, value="true").grid(row=1, column=1, sticky=tk.W, padx=5)
-        ttk.Radiobutton(bool_frame, text="False", variable=con_var, value="false").grid(row=1, column=2, sticky=tk.W, padx=5)
+        ttk.Radiobutton(bool_frame, text="Да", variable=con_var, value="true").grid(row=1, column=1, sticky=tk.W, padx=5)
+        ttk.Radiobutton(bool_frame, text="Не учитывать", variable=con_var, value="false").grid(row=1, column=2, sticky=tk.W, padx=5)
         
         addr_frame = ttk.LabelFrame(frame, text="Сетевые адреса:", padding=10)
         addr_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        ttk.Label(addr_frame, text="Network Interface Address:").pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(addr_frame, text="Адреса интерфейсов: тип сети=CIDR (Sing-box 1.13+)").pack(anchor=tk.W, pady=(0, 2))
         text_interface = scrolledtext.ScrolledText(addr_frame, height=3, width=70, wrap=tk.WORD)
         text_interface.pack(fill=tk.X, pady=(0, 10))
-        text_interface.insert(tk.END, "# 192.168.1.100\n# 10.0.0.5")
+        text_interface.insert(tk.END, "# wifi=192.168.1.0/24\n# cellular=2001:db8::/32")
         
-        ttk.Label(addr_frame, text="Default Interface Address:").pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(addr_frame, text="Адреса интерфейса по умолчанию: CIDR (Sing-box 1.13+)").pack(anchor=tk.W, pady=(0, 2))
         text_default = scrolledtext.ScrolledText(addr_frame, height=3, width=70, wrap=tk.WORD)
         text_default.pack(fill=tk.X)
         text_default.insert(tk.END, "# 8.8.8.8\n# 1.1.1.1")
@@ -849,43 +833,21 @@ class RulesetBuilderGUI:
         type_frame.pack(fill=tk.X, pady=(0, 10))
         
         self.mihomo_behavior = tk.StringVar(value="auto")
-        
-        ttk.Radiobutton(
-            type_frame,
-            text="Автоматически (рекомендуется)",
-            variable=self.mihomo_behavior,
-            value="auto"
-        ).pack(anchor=tk.W, pady=2)
-        
-        ttk.Radiobutton(
-            type_frame,
-            text="Domain - только домены",
-            variable=self.mihomo_behavior,
-            value="domain"
-        ).pack(anchor=tk.W, pady=2)
-        
-        ttk.Radiobutton(
-            type_frame,
-            text="IPCIDR - только IP адреса",
-            variable=self.mihomo_behavior,
-            value="ipcidr"
-        ).pack(anchor=tk.W, pady=2)
-        
-        ttk.Radiobutton(
-            type_frame,
-            text="Classical - домены + IP",
-            variable=self.mihomo_behavior,
-            value="classical"
-        ).pack(anchor=tk.W, pady=2)
-        
+        selectors = ttk.Frame(type_frame)
+        selectors.pack(fill=tk.X)
+        for text, value in [('Авто', 'auto'), ('Домены', 'domain'), ('IP-адреса', 'ipcidr')]:
+            ttk.Radiobutton(selectors, text=text, variable=self.mihomo_behavior, value=value).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(type_frame, text="Для смешанных данных создайте два набора: домены и IP.",
+                  wraplength=750).pack(anchor=tk.W, pady=(8, 0))
+
         # Поле для доменов
-        domain_frame = ttk.LabelFrame(frame, text="Домены (для domain и classical)", padding=5)
+        domain_frame = ttk.LabelFrame(frame, text="Домены (behavior: domain)", padding=5)
         domain_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Подсказка для доменов
         domain_hint = ttk.Label(
             domain_frame,
-            text="Формат: .google.com (суффикс), youtube.com (точное), *.facebook.com (wildcard)",
+            text="example.com — точное; .example.com — поддомены; +.example.com — домен и поддомены; * — одна метка",
             font=('TkDefaultFont', 8),
             foreground='navy'
         )
@@ -914,16 +876,10 @@ class RulesetBuilderGUI:
         domain_count = ttk.Label(domain_btn_frame, text="Строк: 0", foreground="gray")
         domain_count.pack(fill=tk.X, pady=2)
         
-        # Обновление счётчика для доменов
-        def update_domain_count(event=None):
-            content = domain_text.get('1.0', tk.END).strip()
-            lines = [l for l in content.split('\n') if l.strip() and not l.strip().startswith('#')]
-            domain_count.config(text=f"Строк: {len(lines)}")
-        
-        domain_text.bind('<KeyRelease>', update_domain_count)
+        self.bind_counter(domain_text, domain_count)
         
         # Поле для IP адресов
-        ip_frame = ttk.LabelFrame(frame, text="IP адреса (для ipcidr и classical)", padding=5)
+        ip_frame = ttk.LabelFrame(frame, text="IPv4 / IPv6 (behavior: ipcidr)", padding=5)
         ip_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Подсказка для IP
@@ -958,13 +914,7 @@ class RulesetBuilderGUI:
         ip_count = ttk.Label(ip_btn_frame, text="Строк: 0", foreground="gray")
         ip_count.pack(fill=tk.X, pady=2)
         
-        # Обновление счётчика для IP
-        def update_ip_count(event=None):
-            content = ip_text.get('1.0', tk.END).strip()
-            lines = [l for l in content.split('\n') if l.strip() and not l.strip().startswith('#')]
-            ip_count.config(text=f"Строк: {len(lines)}")
-        
-        ip_text.bind('<KeyRelease>', update_ip_count)
+        self.bind_counter(ip_text, ip_count)
         
         # Сохраняем виджеты
         self.mihomo_domain_widget = domain_text
@@ -1039,7 +989,7 @@ class RulesetBuilderGUI:
     def setup_bottom_panel(self, parent):
         """Нижняя панель с кнопками действий"""
         btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
         
         left_frame = ttk.Frame(btn_frame)
         left_frame.pack(side=tk.LEFT)
@@ -1050,6 +1000,9 @@ class RulesetBuilderGUI:
             command=self.show_statistics
         ).pack(side=tk.LEFT, padx=5)
         
+        ttk.Label(btn_frame, textvariable=self.status_text).pack(side=tk.LEFT, padx=10)
+        self.progress = ttk.Progressbar(btn_frame, mode='indeterminate', length=130)
+        self.progress.pack(side=tk.LEFT, padx=5)
         right_frame = ttk.Frame(btn_frame)
         right_frame.pack(side=tk.RIGHT)
         
@@ -1062,7 +1015,7 @@ class RulesetBuilderGUI:
         ttk.Button(
             right_frame,
             text="Выход",
-            command=self.master.quit
+            command=self.on_close
         ).pack(side=tk.LEFT, padx=5)
     
     def copy_log(self):
@@ -1346,7 +1299,6 @@ class RulesetBuilderGUI:
         )
         if path:
             self.singbox_path.set(path)
-            self.output_dir.set(os.path.dirname(path))
             self.log_msg(f"Выбран sing-box: {path}")
     
     def browse_mihomo(self):
@@ -1367,38 +1319,10 @@ class RulesetBuilderGUI:
             self.log_msg(f"Папка вывода: {path}")
     
     def load_file(self, key: str, category: str):
-        """Загрузка данных из файла"""
-        path = filedialog.askopenfilename(
-            title="Выберите файл",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        if not path:
-            return
-        
-        self.log_msg(f"Загрузка файла: {os.path.basename(path)}...")
-        
-        def load_task():
-            try:
-                items = FileProcessor.read_large_file(path)
-                
-                widget_dict = None
-                if category == 'domain':
-                    widget_dict = self.domain_widgets.get(key)
-                elif category == 'ip':
-                    widget_dict = self.ip_widgets.get(key)
-                elif category == 'process':
-                    widget_dict = self.process_widgets.get(key)
-                
-                if widget_dict:
-                    text_widget = widget_dict['text']
-                    text_widget.delete('1.0', tk.END)
-                    text_widget.insert(tk.END, '\n'.join(items))
-                    widget_dict['count'].config(text=f"Строк: {len(items)}")
-                    self.log_msg(f"Загружено {len(items)} записей в {key}")
-            except Exception as e:
-                self.log_msg(f"Ошибка загрузки: {str(e)}")
-        
-        threading.Thread(target=load_task, daemon=True).start()
+        path = filedialog.askopenfilename(title="Выберите UTF-8 список", filetypes=[("Текст", "*.txt *.lst"), ("Все файлы", "*.*")])
+        if path:
+            widgets = {'domain': self.domain_widgets, 'ip': self.ip_widgets, 'process': self.process_widgets}
+            self.load_into_widget(path, widgets[category][key]['text'])
     
     def clear_widget(self, widget):
         """Очистка текстового виджета"""
@@ -1425,48 +1349,17 @@ class RulesetBuilderGUI:
                 break
     
     def validate_field(self, key: str, category: str):
-        """Валидация поля"""
-        widget_dict = None
-        if category == 'domain':
-            widget_dict = self.domain_widgets.get(key)
-        elif category == 'ip':
-            widget_dict = self.ip_widgets.get(key)
-        
-        if not widget_dict:
+        widgets = {'domain': self.domain_widgets, 'ip': self.ip_widgets, 'process': self.process_widgets}
+        data = {key: self.parse_multiline_text(widgets[category][key]['text'])}
+        try:
+            normalized = FileProcessor.normalize_data(data)
+            if not normalized:
+                messagebox.showinfo("Проверка", "Поле пустое")
+                return
+        except ValueError as error:
+            messagebox.showerror("Ошибка данных", str(error))
             return
-        
-        text_widget = widget_dict['text']
-        content = text_widget.get('1.0', tk.END).strip()
-        lines = [l.strip() for l in content.split('\n') if l.strip() and not l.strip().startswith('#')]
-        
-        if not lines:
-            messagebox.showinfo("Валидация", "Поле пустое.")
-            return
-        
-        errors = []
-        
-        for i, line in enumerate(lines, 1):
-            valid = False
-            
-            if key in ['domain', 'domain_suffix']:
-                valid = FileProcessor.validate_domain(line)
-            elif key in ['ip_cidr', 'source_ip_cidr']:
-                valid = FileProcessor.validate_ip_cidr(line)
-            elif key == 'domain_regex':
-                valid = FileProcessor.validate_regex(line)
-            
-            if not valid:
-                errors.append(f"Строка {i}: {line}")
-        
-        if errors:
-            error_msg = f"Найдено {len(errors)} ошибок:\n\n" + "\n".join(errors[:10])
-            if len(errors) > 10:
-                error_msg += f"\n\n... и ещё {len(errors) - 10} ошибок"
-            messagebox.showerror("Ошибки валидации", error_msg)
-            self.log_msg(f"Валидация {key}: найдено {len(errors)} ошибок")
-        else:
-            messagebox.showinfo("Валидация", f"✅ Все {len(lines)} записей валидны!")
-            self.log_msg(f"Валидация {key}: OK")
+        messagebox.showinfo("Проверка", f"Корректных записей: {len(normalized[key])}")
     
     def parse_multiline_text(self, text_widget) -> List[str]:
         """Парсинг текста из виджета"""
@@ -1476,253 +1369,115 @@ class RulesetBuilderGUI:
         return [line.strip() for line in content.split('\n') if line.strip() and not line.strip().startswith('#')]
     
     def collect_data(self) -> Dict:
-        """Сбор всех данных из полей"""
         data = {}
-        
-        for key, widget_dict in self.domain_widgets.items():
-            data[key] = self.parse_multiline_text(widget_dict['text'])
-        
-        for key, widget_dict in self.ip_widgets.items():
-            data[key] = self.parse_multiline_text(widget_dict['text'])
-        
-        for key, widget_dict in self.process_widgets.items():
-            data[key] = self.parse_multiline_text(widget_dict['text'])
-        
-        network_type = self.network_widgets['network_type'].get()
-        if network_type:
-            data['network_type'] = network_type
-        
-        data['network_is_expensive'] = self.network_widgets['network_is_expensive'].get()
-        data['network_is_constrained'] = self.network_widgets['network_is_constrained'].get()
-        
-        data['network_interface_address'] = self.parse_multiline_text(
-            self.network_widgets['network_interface_address']
-        )
-        data['default_interface_address'] = self.parse_multiline_text(
-            self.network_widgets['default_interface_address']
-        )
-        
+        for widgets in (self.domain_widgets, self.ip_widgets, self.process_widgets):
+            for key, widget in widgets.items():
+                data[key] = self.parse_multiline_text(widget['text'])
+        data['network_type'] = [value.strip() for value in self.network_widgets['network_type'].get().split(',') if value.strip()]
+        for key in NETWORK_FLAGS:
+            data[key] = self.network_widgets[key].get()
+        interfaces = {}
+        for index, line in enumerate(self.parse_multiline_text(self.network_widgets['network_interface_address']), 1):
+            name, separator, address = line.partition('=')
+            if not separator:
+                raise ValueError(f'Адреса интерфейсов, запись {index}: используйте тип=CIDR, например wifi=192.168.0.0/16')
+            interfaces.setdefault(name.strip(), []).append(address.strip())
+        data['network_interface_address'] = interfaces
+        data['default_interface_address'] = self.parse_multiline_text(self.network_widgets['default_interface_address'])
         return data
     
     def generate_ruleset(self):
-        """Генерация ruleset"""
-        self.log_msg("Начало генерации ruleset...")
-        
-        # Проверка sing-box для .srs
-        if self.compile_srs.get() and (not self.singbox_path.get() or not os.path.exists(self.singbox_path.get())):
-            messagebox.showerror("Ошибка", "Для компиляции .srs необходимо указать путь к sing-box.exe!")
+        try:
+            data = self.collect_data()
+            base = self.get_output_base()
+            formats = {self.output_format.get()}
+            if self.compile_srs.get():
+                formats.add('srs')
+            if self.generate_mrs.get():
+                formats.add('mrs')
+            singbox = self.singbox_path.get().strip()
+            mihomo = self.mihomo_path.get().strip()
+            validate = self.validate_input.get()
+        except ValueError as error:
+            messagebox.showerror("Ошибка", str(error))
             return
-        
-        # ДОБАВЛЕНО: Проверка mihomo для .mrs
-        if self.generate_mrs.get() and (not self.mihomo_path.get() or not os.path.exists(self.mihomo_path.get())):
-            messagebox.showerror("Ошибка", "Для создания .mrs необходимо указать путь к mihomo.exe!")
+        self.run_task("Создание ruleset…", lambda: RulesetGenerator.export(data, base, formats, singbox, mihomo, validate),
+                      self.show_export_result)
+    
+    def clear_all(self, confirm=True, include_mihomo=True):
+        if confirm and not messagebox.askyesno("Очистить", "Очистить все поля правил?"):
             return
-        
-        data = self.collect_data()
-        
-        if self.validate_input.get():
-            self.log_msg("Валидация данных...")
-        
-        filename = self.output_filename.get()
-        if not filename:
-            filename = "ruleset"
-        
-        output_dir = self.output_dir.get()
-        if not output_dir:
-            output_dir = os.getcwd()
-        
-        # Генерация JSON
-        json_path = os.path.join(output_dir, f"{filename}.json")
-        success, msg, stats = RulesetGenerator.generate_singbox_json(data, json_path)
-        
-        if not success:
-            messagebox.showerror("Ошибка", msg)
-            self.log_msg(f"{msg}")
-            return
-        
-        self.log_msg(f"{msg}")
-        self.log_msg(f"Статистика: Домены={stats['domains']}, IP={stats['ips']}, Процессы={stats['processes']}, Сеть={stats['network']}")
-        
-        # Компиляция .srs
-        if self.compile_srs.get():
-            self.log_msg("Компиляция .srs...")
-            success_srs, msg_srs = RulesetGenerator.compile_srs(self.singbox_path.get(), json_path)
-            self.log_msg(f"{'✅' if success_srs else '❌'} {msg_srs}")
-        
-        # ИСПРАВЛЕНО: Генерация .mrs через mihomo.exe
-        if self.generate_mrs.get():
-            self.log_msg("Генерация .mrs для Mihomo...")
-            
-            # Определяем behavior type на основе данных
-            behavior_type = "domain"  # По умолчанию domain
-            has_domains = any(data.get(k) for k in ['domain', 'domain_suffix', 'domain_keyword'])
-            has_ips = any(data.get(k) for k in ['ip_cidr', 'source_ip_cidr'])
-            
-            if has_ips and not has_domains:
-                behavior_type = "ipcidr"
-            elif has_domains and has_ips:
-                behavior_type = "classical"
-            
-            self.log_msg(f"Использован behavior type: {behavior_type}")
-            
-            # Создаём промежуточный YAML файл
-            yaml_path = os.path.join(output_dir, f"{filename}_mihomo.yaml")
-            success_yaml, msg_yaml, stats_yaml = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
-            
-            if success_yaml:
-                self.log_msg(f"{msg_yaml}")
-                
-                # Компилируем через mihomo.exe
-                mrs_path = os.path.join(output_dir, f"{filename}.mrs")
-                success_mrs, msg_mrs = RulesetGenerator.compile_mrs(
-                    self.mihomo_path.get(),
-                    yaml_path,
-                    mrs_path,
-                    behavior_type
-                )
-                self.log_msg(f"{'✅' if success_mrs else '❌'} {msg_mrs}")
-                
-                # НЕ удаляем промежуточный YAML - оставляем для проверки
-                if success_mrs:
-                    self.log_msg(f"Промежуточный YAML сохранён: {os.path.basename(yaml_path)}")
-            else:
-                self.log_msg(f"{msg_yaml}")
-        
-        messagebox.showinfo("Успех", "Ruleset успешно сгенерирован!")
-        self.log_msg("=" * 60)
-    
-    def clear_all(self):
-        """Очистка всех полей"""
-        if messagebox.askyesno("Подтверждение", "Очистить все поля?"):
-            for widgets in [self.domain_widgets, self.ip_widgets, self.process_widgets]:
-                for widget_dict in widgets.values():
-                    widget_dict['text'].delete('1.0', tk.END)
-                    if 'count' in widget_dict:
-                        widget_dict['count'].config(text="Строк: 0")
-            
-            self.network_widgets['network_type'].set("")
-            self.network_widgets['network_is_expensive'].set("false")
-            self.network_widgets['network_is_constrained'].set("false")
-            self.network_widgets['network_interface_address'].delete('1.0', tk.END)
-            self.network_widgets['default_interface_address'].delete('1.0', tk.END)
-            
-            self.log_msg("Все поля очищены")
-    
-    def show_statistics(self):
-        """Показать статистику"""
-        data = self.collect_data()
-        
-        stats_text = "СТАТИСТИКА ДАННЫХ\n\n"
-        stats_text += "=" * 40 + "\n\n"
-        
-        total = 0
-        
-        stats_text += "Домены:\n"
-        for key in ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex']:
-            count = len(data.get(key, []))
-            total += count
-            stats_text += f"  • {key}: {count}\n"
-        
-        stats_text += f"\n🔢 IP адреса:\n"
-        for key in ['ip_cidr', 'source_ip_cidr']:
-            count = len(data.get(key, []))
-            total += count
-            stats_text += f"  • {key}: {count}\n"
-        
-        stats_text += f"\n⚙️ Процессы:\n"
-        for key in ['process_path_regex', 'package_name']:
-            count = len(data.get(key, []))
-            total += count
-            stats_text += f"  • {key}: {count}\n"
-        
-        stats_text += f"\n📡 Сеть:\n"
-        stats_text += f"  • network_type: {data.get('network_type', 'не задан')}\n"
-        stats_text += f"  • network_is_expensive: {data.get('network_is_expensive', 'false')}\n"
-        stats_text += f"  • network_is_constrained: {data.get('network_is_constrained', 'false')}\n"
-        
-        stats_text += "\n" + "=" * 40 + "\n"
-        stats_text += f"ВСЕГО ЗАПИСЕЙ: {total}"
-        
-        messagebox.showinfo("Статистика", stats_text)
-    
-    def update_preview(self):
-        """Обновление превью JSON"""
-        self.log_msg("Обновление превью...")
-        
-        data = self.collect_data()
-        
-        rules = []
-        
-        domain_rule = {}
-        for key in ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex']:
-            if key in data and data[key]:
-                domain_rule[key] = data[key][:5]
-                if len(data[key]) > 5:
-                    domain_rule[key].append(f"... ещё {len(data[key]) - 5}")
-        if domain_rule:
-            rules.append(domain_rule)
-        
-        ip_rule = {}
-        for key in ['ip_cidr', 'source_ip_cidr']:
-            if key in data and data[key]:
-                ip_rule[key] = data[key][:5]
-                if len(data[key]) > 5:
-                    ip_rule[key].append(f"... ещё {len(data[key]) - 5}")
-        if ip_rule:
-            rules.append(ip_rule)
-        
-        preview_json = {
-            "version": 1,
-            "rules": rules
-        }
-        
+        for widgets in (self.domain_widgets, self.ip_widgets, self.process_widgets):
+            for widget in widgets.values():
+                widget['text'].delete('1.0', tk.END)
+        self.network_widgets['network_type'].set('')
+        for key in NETWORK_FLAGS:
+            self.network_widgets[key].set('false')
+        for key in ('network_interface_address', 'default_interface_address'):
+            self.network_widgets[key].delete('1.0', tk.END)
+        if include_mihomo:
+            self.clear_mihomo_widgets()
         self.preview_text.configure(state='normal')
         self.preview_text.delete('1.0', tk.END)
-        self.preview_text.insert(tk.END, json.dumps(preview_json, indent=2, ensure_ascii=False))
         self.preview_text.configure(state='disabled')
-        
-        self.log_msg("Превью обновлено")
+        self.log_msg("Поля очищены")
+    
+    def show_statistics(self):
+        try:
+            data = FileProcessor.normalize_data(self.collect_data())
+            stats = RulesetGenerator.build_singbox_ruleset(data)[1] if data else dict.fromkeys(('domains', 'ips', 'processes', 'network', 'total'), 0)
+        except ValueError as error:
+            messagebox.showerror('Ошибка данных', str(error))
+            return
+        messagebox.showinfo('Статистика', '\n'.join(f'{label}: {stats[key]}' for key, label in [
+            ('domains', 'Домены'), ('ips', 'IP-адреса'), ('processes', 'Процессы'),
+            ('network', 'Сетевые условия'), ('total', 'Всего')]))
+
+    def update_preview(self):
+        try:
+            data = FileProcessor.normalize_data(self.collect_data())
+            ruleset = RulesetGenerator.build_singbox_ruleset(data)[0] if data else {'version': 1, 'rules': []}
+        except ValueError as error:
+            messagebox.showerror("Ошибка данных", str(error))
+            return
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', tk.END)
+        self.preview_text.insert('1.0', json.dumps(ruleset, indent=2, ensure_ascii=False))
+        self.preview_text.configure(state='disabled')
+        self.log_msg("Превью содержит полный JSON; регулярные выражения проверяются Sing-box при экспорте.")
     
     def apply_template(self, template_data: Dict):
-        """Применение шаблона"""
-        if messagebox.askyesno("Применить шаблон", "Заменить текущие данные шаблоном?"):
-            self.clear_all()
-            
-            for key, values in template_data.items():
-                widget_dict = None
-                
-                if key in self.domain_widgets:
-                    widget_dict = self.domain_widgets[key]
-                elif key in self.ip_widgets:
-                    widget_dict = self.ip_widgets[key]
-                
-                if widget_dict:
-                    widget_dict['text'].insert(tk.END, '\n'.join(values))
-                    widget_dict['count'].config(text=f"Строк: {len(values)}")
-            
-            self.log_msg(f"📋 Шаблон применён")
+        try:
+            data = FileProcessor.normalize_data(template_data)
+        except (ValueError, TypeError) as error:
+            messagebox.showerror("Ошибка шаблона", str(error))
+            return
+        if not messagebox.askyesno("Применить шаблон", "Заменить поля Sing-box данными шаблона?"):
+            return
+        self.clear_all(confirm=False, include_mihomo=False)
+        for widgets in (self.domain_widgets, self.ip_widgets, self.process_widgets):
+            for key, widget in widgets.items():
+                widget['text'].insert('1.0', '\n'.join(data.get(key, [])))
+        self.network_widgets['network_type'].set(', '.join(data.get('network_type', [])))
+        for key in NETWORK_FLAGS:
+            self.network_widgets[key].set('true' if data.get(key) else 'false')
+        lines = [f'{name}={address}' for name, addresses in data.get('network_interface_address', {}).items() for address in addresses]
+        self.network_widgets['network_interface_address'].insert('1.0', '\n'.join(lines))
+        self.network_widgets['default_interface_address'].insert('1.0', '\n'.join(data.get('default_interface_address', [])))
+        self.log_msg("Шаблон применён")
     
     def save_custom_template(self):
-        """Сохранение пользовательского шаблона"""
-        data = self.collect_data()
-
-        template = {k: v for k, v in data.items() if v and ((isinstance(v, list) and len(v) > 0) or (isinstance(v, str) and v.strip()))}
-
-        if not template:
-            messagebox.showwarning("Предупреждение", "Нет данных для сохранения!")
-            return
-        
-        path = filedialog.asksaveasfilename(
-            title="Сохранить шаблон",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")]
-        )
-        
-        if path:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(template, f, indent=2, ensure_ascii=False)
-            self.log_msg(f"💾 Шаблон сохранён: {os.path.basename(path)}")
-            messagebox.showinfo("Успех", "Шаблон сохранён!")
+        try:
+            data = FileProcessor.normalize_data(self.collect_data())
+            if not data:
+                messagebox.showwarning("Шаблон", "Нет данных для сохранения")
+                return
+            path = filedialog.asksaveasfilename(title="Сохранить шаблон", defaultextension='.json', filetypes=[('JSON', '*.json')])
+            if path:
+                RulesetGenerator.write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + '\n')
+                self.log_msg(f"Шаблон сохранён: {Path(path).name}")
+        except (ValueError, OSError) as error:
+            messagebox.showerror("Ошибка сохранения", str(error))
     
     def browse_geo_input_dir(self):
         """Выбор Input директории"""
@@ -1749,127 +1504,59 @@ class RulesetBuilderGUI:
             self.log_msg(f"Source файл: {os.path.basename(path)}")
     
     def create_geo_input_files(self):
-        """Создание входных файлов из текущих данных"""
-        input_dir = self.geo_input_dir.get()
-        
-        if not input_dir:
-            messagebox.showwarning("Предупреждение", "Укажите Input Directory!")
-            return
-        
-        os.makedirs(input_dir, exist_ok=True)
-        
-        data = self.collect_data()
-        
-        created_files = []
-        
-        if data.get('domain') or data.get('domain_suffix'):
-            domain_file = os.path.join(input_dir, "include-domain-custom.lst")
-            with open(domain_file, 'w', encoding='utf-8') as f:
-                for domain in data.get('domain', []):
-                    f.write(f"{domain}\n")
-                for suffix in data.get('domain_suffix', []):
-                    f.write(f"{suffix}\n")
-            created_files.append("include-domain-custom.lst")
-        
-        if data.get('ip_cidr'):
-            ip_file = os.path.join(input_dir, "include-ip-custom.lst")
-            with open(ip_file, 'w', encoding='utf-8') as f:
-                for ip in data['ip_cidr']:
-                    f.write(f"{ip}\n")
-            created_files.append("include-ip-custom.lst")
-        
-        if data.get('domain_regex'):
-            regex_file = os.path.join(input_dir, "exclude-domain-custom.rgx")
-            with open(regex_file, 'w', encoding='utf-8') as f:
-                for pattern in data['domain_regex']:
-                    f.write(f"{pattern}\n")
-            created_files.append("exclude-domain-custom.rgx")
-        
-        if created_files:
-            self.log_msg(f"Создано файлов: {len(created_files)}")
-            messagebox.showinfo(
-                "Успех",
-                f"Входные файлы созданы!\n\n"
-                f"Директория: {input_dir}\n"
-                f"Файлов: {len(created_files)}\n\n"
-                f"{chr(10).join(created_files)}"
-            )
-        else:
-            messagebox.showwarning("Предупреждение", "Нет данных для создания файлов!")
+        try:
+            data = FileProcessor.normalize_data(self.collect_data())
+            unsupported = set(data) - {'domain', 'domain_suffix', 'ip_cidr'}
+            if unsupported:
+                raise ValueError('Эти поля нельзя перенести в GeoIP/GeoSite списки без изменения смысла: ' + ', '.join(sorted(unsupported)))
+            if not data:
+                raise ValueError('Нет данных для создания файлов')
+            input_dir = Path(self.geo_input_dir.get())
+            files = []
+            domains = data.get('domain', []) + data.get('domain_suffix', [])
+            for filename, values in [('include-domain-custom.lst', domains), ('include-ip-custom.lst', data.get('ip_cidr', []))]:
+                if values:
+                    RulesetGenerator.write_text(str(input_dir / filename), '\n'.join(values) + '\n')
+                    files.append(filename)
+            self.log_msg('Созданы файлы: ' + ', '.join(files))
+            messagebox.showinfo('Готово', '\n'.join(files))
+        except (ValueError, OSError) as error:
+            messagebox.showerror('Ошибка', str(error))
     
     def run_geoip_geosite_generation(self):
-        """Запуск generate-geoip-geosite.exe"""
-        exe_path = self.geoip_geosite_path.get()
-        
-        if not exe_path or not os.path.exists(exe_path):
-            messagebox.showerror(
-                "Ошибка",
-                "generate-geoip-geosite.exe не найден!\n\n"
-                "Скачайте утилиту и укажите путь в настройках."
-            )
+        try:
+            executable = RulesetGenerator.resolve_executable(self.geoip_geosite_path.get().strip())
+            input_dir = Path(self.geo_input_dir.get()).absolute()
+            output_dir = Path(self.geo_output_dir.get()).absolute()
+            source_file = self.geo_source_file.get().strip()
+            if source_file and not Path(source_file).is_file():
+                raise ValueError('Source файл не найден')
+            if not source_file and (not input_dir.is_dir() or not any(input_dir.iterdir())):
+                raise ValueError('Укажите Source файл или непустую входную папку')
+            flags = [flag for variable, flag in [
+                (self.gen_geoip, '--gen-geoip'), (self.gen_geosite, '--gen-geosite'),
+                (self.gen_rule_set_json, '--gen-rule-set-json'), (self.gen_rule_set_srs, '--gen-rule-set-srs')
+            ] if variable.get()]
+            if not flags:
+                raise ValueError('Выберите хотя бы один формат результата')
+            cmd = [executable, '-i', str(input_dir), '-o', str(output_dir)] + flags
+            if source_file:
+                cmd += ['-s', str(Path(source_file).absolute())]
+        except (ValueError, OSError) as error:
+            messagebox.showerror("Ошибка", str(error))
             return
-        
-        input_dir = self.geo_input_dir.get()
-        output_dir = self.geo_output_dir.get()
-        
-        if not input_dir or not output_dir:
-            messagebox.showwarning("Предупреждение", "Укажите Input и Output директории!")
-            return
-        
-        if not os.path.exists(input_dir) or not os.listdir(input_dir):
-            messagebox.showwarning(
-                "Предупреждение",
-                "Input Directory пуста!\n\nСоздайте входные файлы или используйте Source файл."
-            )
-            return
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        cmd = [exe_path, "-i", input_dir, "-o", output_dir]
-        
-        source_file = self.geo_source_file.get()
-        if source_file and os.path.exists(source_file):
-            cmd.extend(["-s", source_file])
-        
-        if self.gen_geoip.get():
-            cmd.append("--gen-geoip")
-        if self.gen_geosite.get():
-            cmd.append("--gen-geosite")
-        if self.gen_rule_set_json.get():
-            cmd.append("--gen-rule-set-json")
-        if self.gen_rule_set_srs.get():
-            cmd.append("--gen-rule-set-srs")
-        
-        self.log_msg("=" * 60)
-        self.log_msg(f"🚀 Запуск generate-geoip-geosite")
-        self.log_msg(f"Команда: {' '.join(cmd)}")
-        self.log_msg("=" * 60)
-        
-        def run_generation():
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    cwd=os.path.dirname(exe_path),
-                    timeout=300
-                )
-                
-                if result.stdout:
-                    self.log_msg(result.stdout)
-                if result.stderr:
-                    self.log_msg(result.stderr)
-                
-                self.master.after(0, lambda: self.show_generation_result(result.returncode, output_dir))
-                
-            except subprocess.TimeoutExpired:
-                self.log_msg("Таймаут выполнения (>5 минут)")
-                self.master.after(0, lambda: messagebox.showerror("Ошибка", "Таймаут выполнения!"))
-            except Exception as e:
-                self.log_msg(f"Ошибка: {str(e)}")
-                self.master.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
-        
-        threading.Thread(target=run_generation, daemon=True).start()
+        def generate():
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                  timeout=300, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        def finished(result):
+            if result.stdout:
+                self.log_msg(result.stdout)
+            if result.stderr:
+                self.log_msg(result.stderr)
+            self.show_generation_result(result.returncode, str(output_dir))
+        self.run_task('Создание GeoIP/GeoSite…', generate, finished)
     
     def show_generation_result(self, returncode, output_dir):
         """Показать результат генерации"""
@@ -1928,179 +1615,38 @@ class RulesetBuilderGUI:
                 messagebox.showerror("Ошибка", f"Не удалось загрузить шаблон:\n{str(e)}")
     
     def load_mihomo_file(self, field_type: str):
-        """Загрузка файла для вкладки Mihomo"""
-        path = filedialog.askopenfilename(
-            title="Выберите файл",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        if not path:
-            return
-        
-        self.log_msg(f"Загрузка файла для Mihomo: {os.path.basename(path)}...")
-        
-        try:
-            items = FileProcessor.read_large_file(path)
-            
-            if field_type == 'domain':
-                self.mihomo_domain_widget.delete('1.0', tk.END)
-                self.mihomo_domain_widget.insert(tk.END, '\n'.join(items))
-            elif field_type == 'ip':
-                self.mihomo_ip_widget.delete('1.0', tk.END)
-                self.mihomo_ip_widget.insert(tk.END, '\n'.join(items))
-            
-            self.log_msg(f"Загружено {len(items)} записей")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось загрузить файл:\n{str(e)}")
+        path = filedialog.askopenfilename(title="Выберите UTF-8 список", filetypes=[("Текст", "*.txt *.lst"), ("Все файлы", "*.*")])
+        if path:
+            widget = self.mihomo_domain_widget if field_type == 'domain' else self.mihomo_ip_widget
+            self.load_into_widget(path, widget)
     
     def preview_mihomo_yaml(self):
-        """Предпросмотр YAML для Mihomo"""
-        # Собираем данные
-        domains = self.parse_multiline_text(self.mihomo_domain_widget)
-        ips = self.parse_multiline_text(self.mihomo_ip_widget)
-        
-        if not domains and not ips:
-            messagebox.showwarning("Предупреждение", "Добавьте домены или IP адреса!")
+        try:
+            content, behavior, stats = RulesetGenerator.build_mihomo_yaml(self.collect_mihomo_data(), self.mihomo_behavior.get())
+        except ValueError as error:
+            messagebox.showerror("Ошибка MRS", str(error))
             return
-        
-        # Определяем behavior
-        behavior = self.mihomo_behavior.get()
-        if behavior == "auto":
-            if domains and not ips:
-                behavior = "domain"
-            elif ips and not domains:
-                behavior = "ipcidr"
-            else:
-                behavior = "classical"
-        
-        # Генерируем YAML
-        yaml_content = "payload:\n"
-        
-        if behavior == "domain":
-            for domain in domains:
-                yaml_content += f"  - {domain}\n"
-        elif behavior == "ipcidr":
-            for ip in ips:
-                yaml_content += f"  - {ip}\n"
-        else:  # classical
-            for domain in domains:
-                if domain.startswith('.'):
-                    yaml_content += f"  - DOMAIN-SUFFIX,{domain.lstrip('.')}\n"
-                else:
-                    yaml_content += f"  - DOMAIN,{domain}\n"
-            for ip in ips:
-                yaml_content += f"  - IP-CIDR,{ip}\n"
-        
-        # Показываем в окне
-        preview_window = tk.Toplevel(self.master)
-        preview_window.title(f"Предпросмотр YAML - Behavior: {behavior}")
-        preview_window.geometry("600x400")
-        
-        ttk.Label(
-            preview_window,
-            text=f"Behavior type: {behavior} | Доменов: {len(domains)} | IP: {len(ips)}",
-            font=('TkDefaultFont', 10, 'bold')
-        ).pack(pady=10)
-        
-        text_widget = scrolledtext.ScrolledText(preview_window, wrap=tk.WORD, font=('Consolas', 9))
-        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        text_widget.insert(tk.END, yaml_content)
-        text_widget.config(state='disabled')
-        
-        btn_frame = ttk.Frame(preview_window)
-        btn_frame.pack(pady=10)
-        
-        ttk.Button(
-            btn_frame,
-            text="Копировать",
-            command=lambda: [preview_window.clipboard_clear(), preview_window.clipboard_append(yaml_content)]
-        ).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(
-            btn_frame,
-            text="Закрыть",
-            command=preview_window.destroy
-        ).pack(side=tk.LEFT, padx=5)
-        
-        self.log_msg(f"👁️ Предпросмотр YAML: behavior={behavior}, записей={len(domains) + len(ips)}")
+        window = tk.Toplevel(self.master)
+        window.title(f"Mihomo YAML — {behavior}")
+        window.geometry("720x460")
+        ttk.Label(window, text=f"behavior: {behavior} | Записей: {stats['total']}").pack(pady=10)
+        text = scrolledtext.ScrolledText(window, wrap=tk.NONE, font='TkFixedFont')
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert('1.0', content)
+        text.configure(state='disabled')
+        ttk.Button(window, text="Копировать", command=lambda: [window.clipboard_clear(), window.clipboard_append(content)]).pack(pady=10)
     
     def generate_mihomo_only(self):
-        """Генерация только .mrs файла из вкладки Mihomo"""
-        # Проверяем mihomo.exe
-        if not self.mihomo_path.get() or not os.path.exists(self.mihomo_path.get()):
-            messagebox.showerror("Ошибка", "Укажите путь к mihomo.exe в настройках!")
+        try:
+            data = self.collect_mihomo_data()
+            base = self.get_output_base()
+            behavior = self.mihomo_behavior.get()
+            mihomo = self.mihomo_path.get().strip()
+        except ValueError as error:
+            messagebox.showerror("Ошибка", str(error))
             return
-        
-        # Собираем данные
-        domains = self.parse_multiline_text(self.mihomo_domain_widget)
-        ips = self.parse_multiline_text(self.mihomo_ip_widget)
-        
-        if not domains and not ips:
-            messagebox.showwarning("Предупреждение", "Добавьте домены или IP адреса!")
-            return
-        
-        # Определяем behavior
-        behavior = self.mihomo_behavior.get()
-        if behavior == "auto":
-            if domains and not ips:
-                behavior = "domain"
-            elif ips and not domains:
-                behavior = "ipcidr"
-            else:
-                behavior = "classical"
-        
-        self.log_msg("=" * 60)
-        self.log_msg("Генерация .mrs файла для Mihomo...")
-        self.log_msg(f"Behavior type: {behavior}")
-        self.log_msg(f"Доменов: {len(domains)}, IP: {len(ips)}")
-        
-        # Создаём данные для генератора
-        data = {}
-        if behavior == "domain":
-            data['domain'] = domains
-        elif behavior == "ipcidr":
-            data['ip_cidr'] = ips
-        else:  # classical
-            data['domain'] = domains
-            data['ip_cidr'] = ips
-        
-        # Имя файла и папка
-        filename = self.output_filename.get() or "mihomo_ruleset"
-        output_dir = self.output_dir.get() or os.getcwd()
-        
-        # Генерируем YAML
-        yaml_path = os.path.join(output_dir, f"{filename}_mihomo.yaml")
-        success_yaml, msg_yaml, stats_yaml = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
-        
-        if success_yaml:
-            self.log_msg(f"{msg_yaml}")
-            
-            # Компилируем .mrs
-            mrs_path = os.path.join(output_dir, f"{filename}.mrs")
-            success_mrs, msg_mrs = RulesetGenerator.compile_mrs(
-                self.mihomo_path.get(),
-                yaml_path,
-                mrs_path,
-                behavior
-            )
-            self.log_msg(f"{'✅' if success_mrs else '❌'} {msg_mrs}")
-            
-            # Сохраняем YAML
-            if success_mrs:
-                self.log_msg(f"YAML файл сохранён: {os.path.basename(yaml_path)}")
-                messagebox.showinfo(
-                    "Успех!",
-                    f"Файлы созданы:\n\n"
-                    f"✅ {filename}.mrs ({os.path.getsize(mrs_path)} байт)\n"
-                    f"✅ {filename}_mihomo.yaml\n\n"
-                    f"Behavior: {behavior}"
-                )
-            else:
-                messagebox.showerror("Ошибка", msg_mrs)
-        else:
-            self.log_msg(f"{msg_yaml}")
-            messagebox.showerror("Ошибка", msg_yaml)
-        
-        self.log_msg("=" * 60)
+        self.run_task("Создание MRS…", lambda: RulesetGenerator.export(data, base, ['mrs'], mihomo_path=mihomo,
+                                                                       behavior_type=behavior), self.show_export_result)
     
     def show_about(self):
         """О программе"""
@@ -2130,113 +1676,182 @@ Ruleset Builder v{VERSION}
         self.log.configure(state='disabled')
     
     def log_msg(self, msg: str):
-        """Добавление сообщения в лог"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        if threading.current_thread() is not threading.main_thread():
+            self._ui_events.put(('log', msg))
+            return
+        timestamp = datetime.now().strftime('%H:%M:%S')
         self.log.configure(state='normal')
-        self.log.insert(tk.END, f"[{timestamp}] {msg}\n")
+        self.log.insert(tk.END, f'[{timestamp}] {msg}\n')
         self.log.see(tk.END)
         self.log.configure(state='disabled')
+
+    def scrollable_tab(self, builder):
+        outer = ttk.Frame(self.notebook)
+        canvas = tk.Canvas(outer, highlightthickness=0, height=1)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        inner = builder(canvas)
+        item = canvas.create_window(0, 0, anchor=tk.NW, window=inner)
+        def resize(event=None):
+            canvas.itemconfigure(item, width=canvas.winfo_width(), height=max(canvas.winfo_height(), inner.winfo_reqheight()))
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        canvas.bind('<Configure>', resize)
+        inner.bind('<Configure>', lambda event: canvas.configure(scrollregion=canvas.bbox('all')))
+        def scroll(event):
+            step = -1 if getattr(event, 'num', None) == 4 or getattr(event, 'delta', 0) > 0 else 1
+            canvas.yview_scroll(step * 3, 'units')
+            return 'break'
+        def bind_children(widget):
+            if not isinstance(widget, (tk.Text, ttk.Combobox)):
+                for sequence in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+                    widget.bind(sequence, scroll, add='+')
+            for child in widget.winfo_children():
+                bind_children(child)
+        bind_children(outer)
+        return outer
+
+    def bind_counter(self, text, label):
+        def changed(event=None):
+            if text.edit_modified():
+                label.configure(text=f'Строк: {len(self.parse_multiline_text(text))}')
+                text.edit_modified(False)
+        text.bind('<<Modified>>', changed)
+        changed()
+
+    def get_output_base(self):
+        filename = self.output_filename.get().strip() or 'ruleset'
+        if filename in ('.', '..') or re.search(r'[<>:"/\\|?*\x00-\x1f]', filename) or filename.endswith(('.', ' ')):
+            raise ValueError('Укажите имя файла без пути и специальных символов')
+        return str(Path(self.output_dir.get().strip() or os.getcwd()) / filename)
+
+    def collect_mihomo_data(self):
+        return {'domain': self.parse_multiline_text(self.mihomo_domain_widget),
+                'ip_cidr': self.parse_multiline_text(self.mihomo_ip_widget)}
+
+    def load_into_widget(self, path, widget):
+        def finished(items):
+            widget.delete('1.0', tk.END)
+            widget.insert('1.0', '\n'.join(items))
+            self.log_msg(f'Загружено записей: {len(items)}')
+        self.run_task('Чтение файла…', lambda: FileProcessor.read_large_file(path), finished)
+
+    def set_busy(self, busy):
+        self._busy = busy
+        if busy:
+            self._disabled_widgets = []
+            def disable(widget):
+                if isinstance(widget, (ttk.Button, ttk.Entry, ttk.Checkbutton, ttk.Radiobutton, tk.Text)):
+                    self._disabled_widgets.append((widget, widget.cget('state')))
+                    widget.configure(state='disabled')
+                for child in widget.winfo_children():
+                    disable(child)
+            disable(self.master)
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            for widget, state in self._disabled_widgets:
+                if widget.winfo_exists():
+                    widget.configure(state=state)
+            self._disabled_widgets = []
+
+    def run_task(self, title, function, finished):
+        if self._busy:
+            return
+        self.set_busy(True)
+        self.status_text.set(title)
+        self.log_msg(title)
+        def worker():
+            try:
+                self._ui_events.put(('done', finished, function(), None))
+            except Exception as error:
+                self._ui_events.put(('done', finished, None, str(error)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll_tasks(self):
+        try:
+            while True:
+                event = self._ui_events.get_nowait()
+                if event[0] == 'log':
+                    self.log_msg(event[1])
+                    continue
+                _, finished, result, error = event
+                self.set_busy(False)
+                self.status_text.set('Ошибка' if error else 'Готово')
+                if error:
+                    self.log_msg(error)
+                    messagebox.showerror('Ошибка операции', error)
+                else:
+                    finished(result)
+        except queue.Empty:
+            pass
+        finally:
+            if not self._closed:
+                self._poll_id = self.master.after(50, self.poll_tasks)
+
+    def show_export_result(self, result):
+        success, messages = result
+        for message in messages:
+            self.log_msg(message)
+        self.status_text.set('Файлы созданы' if success else 'Ошибка экспорта')
+        if success:
+            messagebox.showinfo('Готово', '\n'.join(messages))
+        else:
+            self.notebook.select(self.log_frame)
+            messagebox.showerror('Ошибка экспорта', '\n'.join(messages))
+
+    def on_close(self):
+        if self._busy:
+            messagebox.showinfo('Операция выполняется', 'Дождитесь завершения текущей операции перед закрытием.')
+            return
+        self._closed = True
+        self.master.after_cancel(self._poll_id)
+        self.master.destroy()
 
 # ============================================================================
 # CLI ИНТЕРФЕЙС
 # ============================================================================
 
-def cli_mode():
-    """Режим командной строки"""
-    parser = argparse.ArgumentParser(
-        description=f"Ruleset Builder v{VERSION} - CLI Mode",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    parser.add_argument('-o', '--output', required=True, help='Выходной файл (без расширения)')
-    parser.add_argument('-f', '--format', choices=['json', 'srs', 'mrs'], default='json', help='Формат выходного файла')
-    parser.add_argument('--singbox', help='Путь к sing-box.exe (для .srs)')
-    parser.add_argument('--mihomo', help='Путь к mihomo.exe (для .mrs)')
-    
-    parser.add_argument('--domain', help='Файл с доменами')
-    parser.add_argument('--domain-suffix', help='Файл с суффиксами доменов')
-    parser.add_argument('--domain-keyword', help='Файл с ключевыми словами')
-    parser.add_argument('--domain-regex', help='Файл с regex для доменов')
-    
-    parser.add_argument('--ip-cidr', help='Файл с IP CIDR')
-    parser.add_argument('--source-ip-cidr', help='Файл с Source IP CIDR')
-    
-    parser.add_argument('--validate', action='store_true', help='Валидировать входные данные')
-    
-    args = parser.parse_args()
-    
-    data = {}
-    
-    if args.domain:
-        data['domain'] = FileProcessor.read_large_file(args.domain)
-    if args.domain_suffix:
-        data['domain_suffix'] = FileProcessor.read_large_file(args.domain_suffix)
-    if args.domain_keyword:
-        data['domain_keyword'] = FileProcessor.read_large_file(args.domain_keyword)
-    if args.domain_regex:
-        data['domain_regex'] = FileProcessor.read_large_file(args.domain_regex)
-    if args.ip_cidr:
-        data['ip_cidr'] = FileProcessor.read_large_file(args.ip_cidr)
-    if args.source_ip_cidr:
-        data['source_ip_cidr'] = FileProcessor.read_large_file(args.source_ip_cidr)
-    
-    if args.validate:
-        print("Валидация данных...")
-    
-    output_path = f"{args.output}.{args.format}"
-    
-    if args.format == 'json':
-        success, msg, stats = RulesetGenerator.generate_singbox_json(data, output_path)
-        print(f"{'[OK]' if success else '[ERROR]'} {msg}")
-        if success:
-            print(f"Статистика: {stats}")
-    
-    elif args.format == 'srs':
-        json_path = f"{args.output}.json"
-        success, msg, stats = RulesetGenerator.generate_singbox_json(data, json_path)
-        if success:
-            print(f"{msg}")
-            if args.singbox:
-                success_srs, msg_srs = RulesetGenerator.compile_srs(args.singbox, json_path)
-                print(f"{'[OK]' if success_srs else '[ERROR]'} {msg_srs}")
-            else:
-                print("[ERROR] Требуется --singbox для компиляции .srs")
-    
-    elif args.format == 'mrs':
-        yaml_path = f"{args.output}_mihomo.yaml"
-        success, msg, stats = RulesetGenerator.generate_mihomo_yaml(data, yaml_path)
-        if success:
-            print(f"{msg}")
-            if args.mihomo:
-                # Определяем behavior type
-                has_domains = any(data.get(k) for k in ['domain', 'domain_suffix', 'domain_keyword'])
-                has_ips = any(data.get(k) for k in ['ip_cidr', 'source_ip_cidr'])
+def cli_mode(argv=None):
+    """Режим командной строки: ненулевой код завершения при любой ошибке."""
+    parser = argparse.ArgumentParser(description=f'Ruleset Builder v{VERSION}')
+    parser.add_argument('-o', '--output', required=True, help='Выходной путь (расширение необязательно)')
+    parser.add_argument('-f', '--format', choices=['json', 'srs', 'mrs'], default='json')
+    parser.add_argument('--singbox', default='', help='Путь к Sing-box или имя в PATH')
+    parser.add_argument('--mihomo', default='', help='Путь к Mihomo или имя в PATH')
+    for name in DOMAIN_FIELDS + IP_FIELDS:
+        parser.add_argument('--' + name.replace('_', '-'), help='Файл UTF-8, одна запись на строку')
+    parser.add_argument('--validate', action='store_true', help='Дополнительно проверить JSON компилятором --singbox')
+    args = parser.parse_args(argv)
+    try:
+        data = {key: FileProcessor.read_large_file(getattr(args, key))
+                for key in DOMAIN_FIELDS + IP_FIELDS if getattr(args, key)}
+        success, messages = RulesetGenerator.export(data, args.output, [args.format],
+                                                    args.singbox, args.mihomo, args.validate)
+    except (OSError, UnicodeError) as error:
+        success, messages = False, [f'Ошибка чтения: {error}']
+    for message in messages:
+        print(f'{"[OK]" if success else "[ERROR]"} {message}', file=sys.stdout if success else sys.stderr)
+    return 0 if success else 1
 
-                if has_ips and not has_domains:
-                    behavior_type = "ipcidr"
-                elif has_domains and has_ips:
-                    behavior_type = "classical"
-                else:
-                    behavior_type = "domain"
-
-                print(f"Использован behavior type: {behavior_type}")
-                success_mrs, msg_mrs = RulesetGenerator.compile_mrs(args.mihomo, yaml_path, output_path, behavior_type)
-                print(f"{'[OK]' if success_mrs else '[ERROR]'} {msg_mrs}")
-            else:
-                print("[ERROR] Требуется --mihomo для компиляции .mrs")
-
-# ============================================================================
-# ГЛАВНАЯ ФУНКЦИЯ
-# ============================================================================
 
 def main():
-    """Точка входа"""
+    """Точка входа."""
     if len(sys.argv) > 1:
-        cli_mode()
-    else:
+        return cli_mode()
+    if tk is None:
+        print('Для GUI необходим Tkinter. В Debian/Ubuntu установите python3-tk; CLI работает без него.', file=sys.stderr)
+        return 1
+    try:
         root = tk.Tk()
-        app = RulesetBuilderGUI(root)
-        root.mainloop()
+    except tk.TclError as error:
+        print(f'Не удалось открыть GUI: {error}. Для CLI используйте --help.', file=sys.stderr)
+        return 1
+    RulesetBuilderGUI(root)
+    root.mainloop()
+    return 0
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    sys.exit(main())
